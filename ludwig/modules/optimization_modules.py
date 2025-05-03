@@ -1,5 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,73 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import tensorflow as tf
+from dataclasses import asdict
+from typing import Dict, Optional, Tuple, Type, TYPE_CHECKING
+
+import torch
 
 from ludwig.utils.misc_utils import get_from_registry
+from ludwig.utils.torch_utils import LudwigModule
 
-optimizers_registry = {
-    'sgd': tf.keras.optimizers.SGD,
-    'stochastic_gradient_descent': tf.keras.optimizers.SGD,
-    'gd': tf.keras.optimizers.SGD,
-    'gradient_descent': tf.keras.optimizers.SGD,
-    'adam': tf.keras.optimizers.Adam,
-    'adadelta': tf.keras.optimizers.Adadelta,
-    'adagrad': tf.keras.optimizers.Adagrad,
-    'adamax': tf.keras.optimizers.Adamax,
-    'ftrl': tf.keras.optimizers.Ftrl,
-    'nadam': tf.keras.optimizers.Nadam,
-    'rmsprop': tf.keras.optimizers.RMSprop,
-}
+if TYPE_CHECKING:
+    from ludwig.schema.optimizers import BaseOptimizerConfig, GradientClippingConfig
 
 
-def ClippedOptimizer(type='sgd',
-                     clipglobalnorm=5.0,
-                     clipnorm=None,
-                     clipvalue=None,
-                     horovod=None,
-                     **kwargs):
-    optimizer = get_from_registry(type.lower(), optimizers_registry)(**kwargs)
-    return clip_optimizer(optimizer, clipglobalnorm, clipnorm, clipvalue,
-                          horovod=horovod)
+def create_clipper(gradient_clipping_config: Optional["GradientClippingConfig"]):
+    from ludwig.schema.optimizers import GradientClippingConfig
+
+    """Utility function that will convert a None-type gradient clipping config to the correct form."""
+    if isinstance(gradient_clipping_config, GradientClippingConfig):
+        return gradient_clipping_config
+    # Return default config if provided value is None:
+    return GradientClippingConfig()
 
 
-def clip_optimizer(optimizer, clipglobalnorm, clipnorm, clipvalue,
-                   horovod=None):
-    class _ClippedOptimizer(tf.keras.optimizers.Optimizer):
-        def __init__(self, **kwargs):
-            self.clipglobalnorm = clipglobalnorm
-            self.clipnorm = clipnorm
-            self.clipvalue = clipvalue
-            self.horovod = horovod
-            super(self.__class__, self).__init__(**kwargs)
+def get_optimizer_class_and_kwargs(
+    optimizer_config: "BaseOptimizerConfig", learning_rate: float
+) -> Tuple[Type[torch.optim.Optimizer], Dict]:
+    """Returns the optimizer class and kwargs for the optimizer.
 
-        def minimize_with_tape(self, tape, loss, variables):
-            if self.horovod:
-                tape = self.horovod.DistributedGradientTape(tape)
+    :return: Tuple of optimizer class and kwargs for the optimizer.
+    """
+    from ludwig.schema.optimizers import optimizer_registry
 
-            gradients = tape.gradient(loss, variables)
-            if self.clipglobalnorm:
-                gradients, _ = tf.clip_by_global_norm(gradients,
-                                                      self.clipglobalnorm)
-            if self.clipnorm:
-                gradients = map(
-                    lambda x: tf.clip_by_norm(x, self.clipnorm),
-                    gradients
-                )
-            if self.clipvalue:
-                gradients = map(
-                    lambda x: tf.clip_by_value(
-                        x,
-                        clip_value_min=self.clipvalue[0],
-                        clip_value_max=self.clipvalue[1]
-                    ),
-                    gradients
-                )
-            self.apply_gradients(zip(gradients, variables))
+    # Get the corresponding torch optimizer class for the given config:
+    optimizer_cls = get_from_registry(optimizer_config.type.lower(), optimizer_registry)[0]
 
-        def set_learning_rate(self, learning_rate):
-            self.lr.assign(learning_rate)
+    # Create a dict of parameters to be passed to torch (i.e. everything except `type`):
+    cls_kwargs = {field: value for field, value in asdict(optimizer_config).items() if field != "type"}
+    cls_kwargs["lr"] = learning_rate
 
-    cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
-               dict(_ClippedOptimizer.__dict__))
-    return cls.from_config(optimizer.get_config())
+    return optimizer_cls, cls_kwargs
+
+
+def create_optimizer(
+    model: LudwigModule,
+    optimizer_config: "BaseOptimizerConfig",
+    learning_rate: float,
+) -> torch.optim.Optimizer:
+    """Returns a ready-to-use torch optimizer instance based on the given optimizer config.
+
+    :param model: Underlying Ludwig model
+    :param learning_rate: Initial learning rate for the optimizer
+    :param optimizer_config: Instance of `ludwig.modules.optimization_modules.BaseOptimizerConfig`.
+    :return: Initialized instance of a torch optimizer.
+    """
+    # Make sure the optimizer is compatible with the available resources:
+    if (optimizer_config.is_paged or optimizer_config.is_8bit) and (
+        not torch.cuda.is_available() or torch.cuda.device_count() == 0
+    ):
+        raise ValueError(
+            "Cannot use a paged or 8-bit optimizer on a non-GPU machine. "
+            "Please use a different optimizer or run on a machine with a GPU."
+        )
+
+    optimizer_cls, optimizer_kwargs = get_optimizer_class_and_kwargs(optimizer_config, learning_rate)
+    return optimizer_cls(model.parameters(), **optimizer_kwargs)

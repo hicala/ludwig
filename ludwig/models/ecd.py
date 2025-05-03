@@ -1,362 +1,196 @@
-import copy
 import logging
-from collections import OrderedDict
+import os
+from typing import Dict, Tuple, Union
 
-import tensorflow as tf
+import numpy as np
+import torch
 
-from ludwig.combiners.combiners import get_combiner_class
-from ludwig.constants import *
-from ludwig.features.feature_registries import input_type_registry, \
-    output_type_registry
-from ludwig.utils.algorithms_utils import topological_sort_feature_dependencies
+from ludwig.accounting.used_tokens import get_used_tokens_for_ecd
+from ludwig.combiners.combiners import create_combiner
+from ludwig.constants import MODEL_ECD, MODEL_LLM, USED_TOKENS
+from ludwig.globals import MODEL_WEIGHTS_FILE_NAME
+from ludwig.models.base import BaseModel
+from ludwig.schema.model_types.ecd import ECDModelConfig
+from ludwig.utils import output_feature_utils
+from ludwig.utils.augmentation_utils import AugmentationPipelines
 from ludwig.utils.data_utils import clear_data_cache
-from ludwig.utils.misc_utils import get_from_registry
+from ludwig.utils.fs_utils import open_file
+from ludwig.utils.state_dict_backward_compatibility import update_state_dict
+from ludwig.utils.torch_utils import get_torch_device
 
 logger = logging.getLogger(__name__)
 
 
-class ECD(tf.keras.Model):
+class ECD(BaseModel):
+    @staticmethod
+    def type() -> str:
+        return MODEL_ECD
 
     def __init__(
-            self,
-            input_features_def,
-            combiner_def,
-            output_features_def,
-            random_seed=None,
-            **kwargs
+        self,
+        config_obj: ECDModelConfig,
+        random_seed=None,
+        **_kwargs,
     ):
-        if random_seed is not None:
-            tf.random.set_seed(random_seed)
+        self.config_obj = config_obj
+        self._random_seed = random_seed
 
-        super().__init__()
+        super().__init__(random_seed=self._random_seed)
 
         # ================ Inputs ================
-        self.input_features = build_inputs(
-            input_features_def
-        )
+        try:
+            self.input_features.update(self.build_inputs(input_feature_configs=self.config_obj.input_features))
+        except KeyError as e:
+            raise KeyError(
+                f"An input feature has a name that conflicts with a class attribute of torch's ModuleDict: {e}"
+            ) from e
 
         # ================ Combiner ================
-        logger.debug('Combiner {}'.format(combiner_def[TYPE]))
-        combiner_class = get_combiner_class(combiner_def[TYPE])
-        self.combiner = combiner_class(
-            input_features=self.input_features,
-            **combiner_def,
-            **kwargs
-        )
+        logger.debug(f"Combiner {self.config_obj.combiner.type}")
+        self.combiner = create_combiner(self.config_obj.combiner, input_features=self.input_features)
 
         # ================ Outputs ================
-        self.output_features = build_outputs(
-            output_features_def,
-            self.combiner
+        self.output_features.update(
+            self.build_outputs(output_feature_configs=self.config_obj.output_features, combiner=self.combiner)
         )
-
-        # ================ Combined loss metric ================
-        self.eval_loss_metric = tf.keras.metrics.Mean()
 
         # After constructing all layers, clear the cache to free up memory
         clear_data_cache()
 
-    def get_model_inputs(self, training=True):
-        inputs = {
-            input_feature_name: input_feature.create_input()
-            for input_feature_name, input_feature in
-            self.input_features.items()
-        }
+    def prepare_for_training(self):
+        # 1/10/23: For parity with how the LLM model type sets up adapters and quantization, LLM encoders should call
+        # `prepare_for_training` at training time rather than at initialization. This loop searches for input features
+        # using the LLM encoder and calls `prepare_for_training` on those encoders only. No other changes should be
+        # made to the ECD model itself or any other encoders.
+        for feature in self.config_obj.input_features:
+            encoder_type = feature.encoder.type
+            if encoder_type == MODEL_LLM:
+                feature_name = feature.name
+                encoder = self.input_features.get(feature_name)
+                encoder.prepare_for_training()
 
-        if not training:
-            return inputs
-
-        targets = {
-            output_feature_name: output_feature.create_input()
-            for output_feature_name, output_feature in
-            self.output_features.items()
-        }
-        return inputs, targets
-
-    def get_connected_model(self, training=True, inputs=None):
-        inputs = inputs or self.get_model_inputs(training)
-        outputs = self.call(inputs)
-        return tf.keras.Model(inputs=inputs, outputs=outputs)
-
-    def save_savedmodel(self, save_path):
-        keras_model = self.get_connected_model(training=False)
-        keras_model.save(save_path)
-
-    def call(self, inputs, training=None, mask=None):
-        # parameter inputs is a dict feature_name -> tensor / ndarray
-        # or
-        # parameter (inputs, targets) where
-        #   inputs is a dict feature_name -> tensor/ndarray
-        #   targets is dict feature_name -> tensor/ndarray
-
-        if isinstance(inputs, tuple):
-            inputs, targets = inputs
-        else:
-            targets = None
-        assert inputs.keys() == self.input_features.keys()
+    def encode(
+        self,
+        inputs: Union[
+            Dict[str, torch.Tensor], Dict[str, np.ndarray], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+        ],
+    ):
+        # Convert inputs to tensors.
+        for input_feature_name, input_values in inputs.items():
+            if not isinstance(input_values, torch.Tensor):
+                inputs[input_feature_name] = torch.from_numpy(input_values)
+            else:
+                inputs[input_feature_name] = input_values
 
         encoder_outputs = {}
         for input_feature_name, input_values in inputs.items():
-            encoder = self.input_features[input_feature_name]
-            encoder_output = encoder(input_values, training=training,
-                                     mask=mask)
+            encoder = self.input_features.get(input_feature_name)
+            encoder_output = encoder(input_values)
             encoder_outputs[input_feature_name] = encoder_output
 
-        combiner_outputs = self.combiner(encoder_outputs)
+        return encoder_outputs
 
+    def combine(self, encoder_outputs):
+        return self.combiner(encoder_outputs)
+
+    def decode(self, combiner_outputs, targets, mask):
+        # Invoke output features.
         output_logits = {}
         output_last_hidden = {}
-        for output_feature_name, decoder in self.output_features.items():
-            # use presence or absence of targets
-            # to signal training or prediction
-            decoder_inputs = (combiner_outputs, copy.copy(output_last_hidden))
-            if targets is not None:
-                # targets are only used during training,
-                # during prediction they are omitted
-                decoder_inputs = (decoder_inputs, targets[output_feature_name])
+        for output_feature_name, output_feature in self.output_features.items():
+            # Use the presence or absence of targets to signal training or prediction.
+            target = targets[output_feature_name] if targets is not None else None
+            decoder_outputs = output_feature(combiner_outputs, output_last_hidden, mask=mask, target=target)
 
-            decoder_outputs = decoder(
-                decoder_inputs,
-                training=training,
-                mask=mask
-            )
-            output_logits[output_feature_name] = decoder_outputs
-            output_last_hidden[output_feature_name] = decoder_outputs[
-                'last_hidden']
+            # Add decoder outputs to overall output dictionary.
+            for decoder_output_name, tensor in decoder_outputs.items():
+                output_feature_utils.set_output_feature_tensor(
+                    output_logits, output_feature_name, decoder_output_name, tensor
+                )
 
+            # Save the hidden state of the output feature (for feature dependencies).
+            output_last_hidden[output_feature_name] = decoder_outputs["last_hidden"]
         return output_logits
 
-    def predictions(self, inputs, output_features=None):
-        # check validity of output_features
-        if output_features is None:
-            of_list = self.output_features
-        elif isinstance(output_features, str):
-            if output_features == 'all':
-                of_list = set(self.output_features.keys())
-            elif output_features in self.output_features:
-                of_list = [output_features]
-            else:
-                raise ValueError(
-                    "'output_features' {} is not a valid for this model. "
-                    "Available ones are: {}".format(
-                        output_features, set(self.output_features.keys())
-                    )
-                )
-        elif isinstance(output_features, list or set):
-            if output_features.issubset(self.output_features):
-                of_list = output_features
-            else:
-                raise ValueError(
-                    "'output_features' {} must be a subset of "
-                    "available features {}".format(
-                        output_features, set(self.output_features.keys())
-                    )
-                )
-        else:
-            raise ValueError(
-                "'output_features' must be None or a string or a list "
-                "of output features"
-            )
+    def forward(
+        self,
+        inputs: Union[
+            Dict[str, torch.Tensor], Dict[str, np.ndarray], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+        ],
+        mask=None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass of the model.
 
-        outputs = self.call(inputs, training=False)
+        Args:
+            inputs: Inputs to the model. Can be a dictionary of input names to
+                input tensors or a tuple of (inputs, targets) where inputs is
+                a dictionary of input names to input tensors and targets is a
+                dictionary of target names to target tensors.
+            mask: A mask for the inputs.
 
-        predictions = {}
-        for of_name in of_list:
-            predictions[of_name] = self.output_features[of_name].predictions(
-                outputs[of_name],
-                training=False
-            )
+        Returns:
+            A dictionary of output {feature name}::{tensor_name} -> output tensor.
+        """
 
-        return predictions
-
-    @tf.function
-    def train_step(self, optimizer, inputs, targets,
-                   regularization_lambda=0.0):
-        with tf.GradientTape() as tape:
-            model_outputs = self((inputs, targets), training=True)
-            loss, all_losses = self.train_loss(
-                targets, model_outputs, regularization_lambda
-            )
-        optimizer.minimize_with_tape(
-            tape, loss, self.trainable_variables
-        )
-        # grads = tape.gradient(loss, model.trainable_weights)
-        # optimizer.apply_gradients(zip(grads, model.trainable_weights))
-        return loss, all_losses
-
-    @tf.function
-    def evaluation_step(self, inputs, targets):
-        predictions = self.predictions(inputs, output_features=None)
-        self.update_metrics(targets, predictions)
-        return predictions
-
-    @tf.function
-    def predict_step(self, inputs):
-        return self.predictions(inputs, output_features=None)
-
-    def train_loss(self, targets, predictions, regularization_lambda=0.0):
-        train_loss = 0
-        of_train_losses = {}
-        for of_name, of_obj in self.output_features.items():
-            of_train_loss = of_obj.train_loss(targets[of_name],
-                                              predictions[of_name])
-            train_loss += of_obj.loss['weight'] * of_train_loss
-            of_train_losses[of_name] = of_train_loss
-        train_loss += regularization_lambda * sum(
-            self.losses)  # regularization / other losses
-        return train_loss, of_train_losses
-
-    def eval_loss(self, targets, predictions):
-        eval_loss = 0
-        of_eval_losses = {}
-        for of_name, of_obj in self.output_features.items():
-            of_eval_loss = of_obj.eval_loss(
-                targets[of_name], predictions[of_name]
-            )
-            eval_loss += of_obj.loss['weight'] * of_eval_loss
-            of_eval_losses[of_name] = of_eval_loss
-        eval_loss += sum(self.losses)  # regularization / other losses
-        return eval_loss, of_eval_losses
-
-    def update_metrics(self, targets, predictions):
-        for of_name, of_obj in self.output_features.items():
-            of_obj.update_metrics(targets[of_name], predictions[of_name])
-        self.eval_loss_metric.update_state(
-            self.eval_loss(targets, predictions)[0]
-        )
-
-    def get_metrics(self):
-        all_of_metrics = {}
-        for of_name, of_obj in self.output_features.items():
-            all_of_metrics[of_name] = of_obj.get_metrics()
-        all_of_metrics[COMBINED] = {
-            LOSS: self.eval_loss_metric.result().numpy()
-        }
-        return all_of_metrics
-
-    def reset_metrics(self):
-        for of_obj in self.output_features.values():
-            of_obj.reset_metrics()
-        self.eval_loss_metric.reset_states()
-
-    def collect_weights(
-            self,
-            tensor_names=None,
-            **kwargs
-    ):
-        def recurse_weights(model, prefix=None):
-            results = []
-            for layer in model.layers:
-                layer_prefix = f'{prefix}/{layer.name}' if prefix else layer.name
-                if isinstance(layer, tf.keras.Model):
-                    results += recurse_weights(layer, layer_prefix)
+        if isinstance(inputs, tuple):
+            inputs, targets = inputs
+            # Convert targets to tensors.
+            for target_feature_name, target_value in targets.items():
+                if not isinstance(target_value, torch.Tensor):
+                    targets[target_feature_name] = torch.from_numpy(target_value)
                 else:
-                    results += [(f'{layer_prefix}/{w.name}', w) for w in
-                                layer.weights]
-            return results
+                    targets[target_feature_name] = target_value
+        else:
+            targets = None
 
-        connected_model = self.get_connected_model()
-        weights = recurse_weights(connected_model)
-        if tensor_names:
-            # Check for bad tensor names
-            weight_set = set(name for name, w in weights)
-            for name in tensor_names:
-                if name not in weight_set:
-                    raise ValueError(
-                        f'Tensor {name} not present in the model graph')
+        assert list(inputs.keys()) == self.input_features.keys()
 
-            # Filter the weights
-            tensor_set = set(tensor_names)
-            weights = [(name, w) for name, w in weights if name in tensor_set]
+        encoder_outputs = self.encode(inputs)
+        combiner_outputs = self.combine(encoder_outputs)
+        decoder_outputs = self.decode(combiner_outputs, targets, mask)
 
-        return weights
+        # Compute the number of used tokens.
+        decoder_outputs[USED_TOKENS] = get_used_tokens_for_ecd(inputs, targets)
+        return decoder_outputs
 
+    def unskip(self):
+        for k in self.input_features.keys():
+            self.input_features.set(k, self.input_features.get(k).unskip())
 
-def build_inputs(
-        input_features_def,
-        **kwargs
-):
-    input_features = OrderedDict()
-    input_features_def = topological_sort_feature_dependencies(
-        input_features_def)
-    for input_feature_def in input_features_def:
-        input_features[input_feature_def[NAME]] = build_single_input(
-            input_feature_def,
-            input_features,
-            **kwargs
+    def save(self, save_path):
+        """Saves the model to the given path."""
+        weights_save_path = os.path.join(save_path, MODEL_WEIGHTS_FILE_NAME)
+        torch.save(self.state_dict(), weights_save_path)
+
+    def load(self, save_path):
+        """Loads the model from the given path."""
+        weights_save_path = os.path.join(save_path, MODEL_WEIGHTS_FILE_NAME)
+        device = torch.device(get_torch_device())
+        with open_file(weights_save_path, "rb") as f:
+            state_dict = torch.load(f, map_location=device)
+            self.load_state_dict(update_state_dict(state_dict))
+
+    def get_args(self):
+        """Returns init arguments for constructing this model."""
+        return (
+            self.config_obj.input_features.to_list(),
+            self.config_obj.combiner.to_dict(),
+            self.config_obj.output_features.to_list(),
+            self._random_seed,
         )
-    return input_features
 
+    def get_augmentation_pipelines(self) -> AugmentationPipelines:
+        """Returns the augmentation pipeline for this model."""
+        # dictionary to hold any augmentation pipeline
+        augmentation_pipelines = {}
 
-def build_single_input(input_feature_def, other_input_features, **kwargs):
-    logger.debug('Input {} feature {}'.format(
-        input_feature_def[TYPE],
-        input_feature_def[NAME]
-    ))
+        # loop through all input features and add their augmentation pipeline to the dictionary
+        for input_feature in self.config_obj.input_features:
+            # if augmentation was specified for this input feature, add AugmentationPipeline to dictionary
+            if input_feature.has_augmentation():
+                # use input feature proc_column as key because that is what is used in the Batcher
+                augmentation_pipelines[input_feature.proc_column] = self.input_features.get(
+                    input_feature.name
+                ).get_augmentation_pipeline()
 
-    encoder_obj = None
-    if input_feature_def.get(TIED, None) is not None:
-        tied_input_feature_name = input_feature_def[TIED]
-        if tied_input_feature_name in other_input_features:
-            encoder_obj = other_input_features[
-                tied_input_feature_name].encoder_obj
-
-    input_feature_class = get_from_registry(
-        input_feature_def[TYPE],
-        input_type_registry
-    )
-    input_feature_obj = input_feature_class(input_feature_def, encoder_obj)
-
-    return input_feature_obj
-
-
-dynamic_length_encoders = {
-    'rnn',
-    'embed'
-}
-
-
-def build_outputs(
-        output_features_def,
-        combiner,
-        **kwargs
-):
-    output_features_def = topological_sort_feature_dependencies(
-        output_features_def)
-    output_features = {}
-
-    for output_feature_def in output_features_def:
-        output_feature = build_single_output(
-            output_feature_def,
-            combiner,
-            output_features,
-            **kwargs
-        )
-        output_features[output_feature_def[NAME]] = output_feature
-
-    return output_features
-
-
-def build_single_output(
-        output_feature_def,
-        feature_hidden,
-        other_output_features,
-        **kwargs
-):
-    logger.debug('Output {} feature {}'.format(
-        output_feature_def[TYPE],
-        output_feature_def[NAME]
-    ))
-
-    output_feature_class = get_from_registry(
-        output_feature_def[TYPE],
-        output_type_registry
-    )
-    output_feature_obj = output_feature_class(output_feature_def)
-    # weighted_train_mean_loss, weighted_eval_loss, output_tensors = output_feature_obj.concat_dependencies_and_build_output(
-    #    feature_hidden,
-    #    other_output_features,
-    #    **kwargs
-    # )
-
-    return output_feature_obj
+        return AugmentationPipelines(augmentation_pipelines)

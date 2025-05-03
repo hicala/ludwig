@@ -1,5 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2020 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,61 +13,79 @@
 # limitations under the License.
 # ==============================================================================
 import os
-import time
+from typing import Any, List, Optional
+
+import torch
 
 try:
-    import horovod.tensorflow
+    import horovod.torch
 
-    _HVD = horovod.tensorflow
+    _HVD = horovod.torch
 except (ModuleNotFoundError, ImportError):
     _HVD = None
 
-ON_MASTER = True
 
-
-def configure_horovod(use_horovod):
-    set_on_master(use_horovod)
-    return _HVD if should_use_horovod(use_horovod) else None
-
-
-def should_use_horovod(use_horovod):
-    """Returns True if user did not specify explicitly and running with `horovodrun`."""
-    if use_horovod is None:
-        return has_horovodrun()
-    return use_horovod
+def initialize_horovod():
+    if not _HVD:
+        raise ValueError(
+            "Horovod backend specified, "
+            "but cannot import `horovod.torch`. "
+            "Install Horovod following the instructions at: "
+            "https://github.com/horovod/horovod"
+        )
+    _HVD.init()
+    return _HVD
 
 
 def has_horovodrun():
     """Returns True if running with `horovodrun` using Gloo or OpenMPI."""
-    return 'OMPI_COMM_WORLD_RANK' in os.environ or 'HOROVOD_RANK' in os.environ
+    return "OMPI_COMM_WORLD_RANK" in os.environ or "HOROVOD_RANK" in os.environ
 
 
-def broadcast_return(fn, horovod):
-    """Returns the result of calling `fn` on master, broadcasted to all other ranks.
+def gather_all_tensors(result: torch.Tensor, group: Optional[Any] = None) -> List[torch.Tensor]:
+    """Function to gather all tensors from several processes onto a list that is broadcast to all processes.
 
-    Specifically, `fn` is only executed on master, but its result is returned by every
-    rank by broadcasting the return value from master.
+    Works on tensors that have the same number of dimensions, but where each dimension may differ. In this case
+    tensors are padded, gathered and then trimmed to secure equal workload for all processes.
+
+    :param result: the value to sync
+    :param group: the process group to gather results from (not supported: always uses world)
+
+    :return: list with size equal to the process group where gathered_result[i]
+             corresponds to result tensor from process i
     """
-    result = fn() if is_on_master() else None
-    if horovod:
-        name = f'broadcast_return_{int(time.time())}'
-        result = _HVD.broadcast_object(result, name=name)
-    return result
+    if group is not None:
+        raise ValueError("Horovod does not support allgather using a subcommunicator at this time. " "Unset `group`.")
+
+    if _HVD is None or not _HVD.is_initialized():
+        return [result]
+
+    if len(result.shape) == 0:
+        # Convert scalars to single dimension tensors
+        result = result.reshape(1)
+
+    is_bool = False
+    if result.dtype == torch.bool:
+        # need to convert to int due to Horovod limitation
+        result = result.int()
+        is_bool = True
+
+    # Add extra dimension to the tensors to be gathered
+    result = result.unsqueeze(0)
+
+    # sync and gather all
+    gathered_result = _HVD.allgather(result)
+    # This is to match the output of the torchmetrics gather_all_tensors function
+    # and ensures that the return value is usable by torchmetrics.compute downstream.
+    # Ensures that the output is a list of tensors.
+    gathered_result = list(gathered_result)
+
+    if is_bool:
+        # convert back if needed
+        gathered_result = [t.bool() for t in gathered_result]
+
+    return gathered_result
 
 
-def set_on_master(use_horovod):
-    global ON_MASTER
-    if should_use_horovod(use_horovod):
-        if not _HVD:
-            raise ValueError("use_horovod parameter specified, "
-                             "but cannot import horovod.tensorflow. "
-                             "Install horovod following the instructions at: "
-                             " https://github.com/horovod/horovod")
-        _HVD.init()
-        ON_MASTER = _HVD.rank() == 0
-    else:
-        ON_MASTER = True
-
-
-def is_on_master():
-    return ON_MASTER
+def is_distributed_available() -> bool:
+    return _HVD is not None and (_HVD.is_initialized() or os.environ.get("HOROVOD_RANK"))

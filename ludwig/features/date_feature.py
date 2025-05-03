@@ -1,6 +1,5 @@
 #! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,142 +14,154 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-from datetime import date
-from datetime import datetime
+from datetime import date, datetime
+from typing import Dict, List
 
 import numpy as np
-import tensorflow as tf
-from dateutil.parser import parse
+import torch
 
-from ludwig.constants import *
-from ludwig.encoders.date_encoders import DateEmbed, DateWave
-from ludwig.features.base_feature import InputFeature
-from ludwig.utils.misc_utils import set_default_value
+from ludwig.constants import COLUMN, DATE, PROC_COLUMN
+from ludwig.features.base_feature import BaseFeatureMixin, InputFeature
+from ludwig.schema.features.date_feature import DateInputFeatureConfig
+from ludwig.types import (
+    FeatureConfigDict,
+    FeatureMetadataDict,
+    ModelConfigDict,
+    PreprocessingConfigDict,
+    TrainingSetMetadataDict,
+)
+from ludwig.utils.date_utils import create_vector_from_datetime_obj, parse_datetime
+from ludwig.utils.types import DataFrame, TorchscriptPreprocessingInput
 
 logger = logging.getLogger(__name__)
 
 DATE_VECTOR_LENGTH = 9
 
 
-class DateFeatureMixin(object):
-    type = DATE
-    preprocessing_defaults = {
-        'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': '',
-        'datetime_format': None
-    }
+class _DatePreprocessing(torch.nn.Module):
+    def __init__(self, metadata: TrainingSetMetadataDict):
+        super().__init__()
+
+    def forward(self, v: TorchscriptPreprocessingInput) -> torch.Tensor:
+        if torch.jit.isinstance(v, List[torch.Tensor]):
+            v = torch.stack(v)
+
+        if torch.jit.isinstance(v, torch.Tensor):
+            return v.to(dtype=torch.int)
+        else:
+            raise ValueError(f"Unsupported input: {v}")
+
+
+class DateFeatureMixin(BaseFeatureMixin):
+    @staticmethod
+    def type():
+        return DATE
 
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
-        return {
-            'preprocessing': preprocessing_parameters
-        }
+    def cast_column(column, backend):
+        return column
 
     @staticmethod
-    def date_to_list(date_str, datetime_format, preprocessing_parameters):
+    def get_feature_meta(
+        config: ModelConfigDict,
+        column,
+        preprocessing_parameters: PreprocessingConfigDict,
+        backend,
+        is_input_feature: bool,
+    ) -> FeatureMetadataDict:
+        return {"preprocessing": preprocessing_parameters}
+
+    @staticmethod
+    def date_to_list(date_value, datetime_format, preprocessing_parameters):
         try:
-            if datetime_format is not None:
-                datetime_obj = datetime.strptime(date_str, datetime_format)
+            if isinstance(date_value, datetime):
+                datetime_obj = date_value
+            elif isinstance(date_value, date):
+                datetime_obj = datetime.combine(date=date_value, time=datetime.min.time())
+            elif isinstance(date_value, str) and datetime_format is not None:
+                try:
+                    datetime_obj = datetime.strptime(date_value, datetime_format)
+                except ValueError:
+                    datetime_obj = parse_datetime(date_value)
             else:
-                datetime_obj = parse(date_str)
-        except:
-            logging.error(
-                'Error parsing date: {}. '
-                'Please provide a datetime format that parses it '
-                'in the preprocessing section of the date feature '
-                'in the config. '
-                'The preprocessing fill in value will be used.'
-                'For more details: '
-                'https://ludwig.ai/user_guide/#date-features-preprocessing'
-                    .format(date_str)
+                datetime_obj = parse_datetime(date_value)
+        except Exception as e:
+            logger.error(
+                f"Error parsing date: '{date_value}' with error '{e}' "
+                "Please provide a datetime format that parses it "
+                "in the preprocessing section of the date feature "
+                "in the config. "
+                "The preprocessing fill in value will be used."
+                "For more details: "
+                "https://ludwig-ai.github.io/ludwig-docs/latest/configuration/features/date_features/#date-features-preprocessing"  # noqa
             )
-            fill_value = preprocessing_parameters['fill_value']
-            if fill_value != '':
-                datetime_obj = parse(fill_value)
+            fill_value = preprocessing_parameters["fill_value"]
+            if fill_value != "":
+                datetime_obj = parse_datetime(fill_value)
             else:
                 datetime_obj = datetime.now()
 
-        yearday = (
-                datetime_obj.toordinal() -
-                date(datetime_obj.year, 1, 1).toordinal() + 1
-        )
-
-        midnight = datetime_obj.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        second_of_day = (datetime_obj - midnight).seconds
-
-        return [
-            datetime_obj.year,
-            datetime_obj.month,
-            datetime_obj.day,
-            datetime_obj.weekday(),
-            yearday,
-            datetime_obj.hour,
-            datetime_obj.minute,
-            datetime_obj.second,
-            second_of_day
-        ]
+        return create_vector_from_datetime_obj(datetime_obj)
 
     @staticmethod
     def add_feature_data(
-            feature,
-            dataset_df,
-            dataset,
-            metadata,
-            preprocessing_parameters=None
-    ):
-        datetime_format = preprocessing_parameters['datetime_format']
-        dates_to_lists = [
-            np.array(DateFeatureMixin.date_to_list(
-                row, datetime_format, preprocessing_parameters
-            ))
-            for row in dataset_df[feature[NAME]]
-        ]
-        dataset[feature[NAME]] = np.array(dates_to_lists, dtype=np.int16)
+        feature_config: FeatureConfigDict,
+        input_df: DataFrame,
+        proc_df: Dict[str, DataFrame],
+        metadata: TrainingSetMetadataDict,
+        preprocessing_parameters: PreprocessingConfigDict,
+        backend,  # Union[Backend, str]
+        skip_save_processed_input: bool,
+    ) -> None:
+        datetime_format = preprocessing_parameters["datetime_format"]
+        proc_df[feature_config[PROC_COLUMN]] = backend.df_engine.map_objects(
+            input_df[feature_config[COLUMN]],
+            lambda x: np.array(
+                DateFeatureMixin.date_to_list(x, datetime_format, preprocessing_parameters), dtype=np.int16
+            ),
+        )
+        return proc_df
 
 
 class DateInputFeature(DateFeatureMixin, InputFeature):
-    encoder = 'embed'
+    def __init__(self, input_feature_config: DateInputFeatureConfig, encoder_obj=None, **kwargs):
+        super().__init__(input_feature_config, **kwargs)
 
-    def __init__(self, feature, encoder_obj=None):
-        super().__init__(feature)
-        self.overwrite_defaults(feature)
         if encoder_obj:
             self.encoder_obj = encoder_obj
         else:
-            self.encoder_obj = self.initialize_encoder(feature)
+            self.encoder_obj = self.initialize_encoder(input_feature_config.encoder)
 
-    def call(self, inputs, training=None, mask=None):
-        assert isinstance(inputs, tf.Tensor)
-        assert inputs.dtype == tf.int16
-
-        inputs_encoded = self.encoder_obj(
-            inputs, training=training, mask=mask
-        )
-
+    def forward(self, inputs):
+        assert isinstance(inputs, torch.Tensor), type(inputs)
+        assert inputs.dtype in [torch.int16, torch.int32, torch.int64, torch.float32], inputs.dtype
+        inputs_encoded = self.encoder_obj(inputs)
         return inputs_encoded
 
-    def get_input_dtype(self):
-        return tf.int16
+    @property
+    def input_dtype(self):
+        return torch.int16
 
-    def get_input_shape(self):
-        return DATE_VECTOR_LENGTH,
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([DATE_VECTOR_LENGTH])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.encoder_obj.output_shape
 
     @staticmethod
-    def update_config_with_metadata(
-            input_feature,
-            feature_metadata,
-            *args,
-            **kwargs
-    ):
+    def update_config_with_metadata(feature_config, feature_metadata, *args, **kwargs):
         pass
 
-    @staticmethod
-    def populate_defaults(input_feature):
-        set_default_value(input_feature, TIED, None)
+    def create_sample_input(self, batch_size: int = 2):
+        date = [2013, 2, 26, 1, 57, 0, 0, 0, 0]
+        return torch.Tensor([date for _ in range(batch_size)]).type(torch.int32)
 
-    encoder_registry = {
-        'embed': DateEmbed,
-        'wave': DateWave
-    }
+    @staticmethod
+    def get_schema_cls():
+        return DateInputFeatureConfig
+
+    @staticmethod
+    def create_preproc_module(metadata: TrainingSetMetadataDict) -> torch.nn.Module:
+        return _DatePreprocessing(metadata)

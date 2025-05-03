@@ -1,6 +1,5 @@
 #! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,48 +14,56 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+from typing import Any, Dict, List, Optional, Type
 
-from tensorflow.keras.layers import Layer
+import torch
 
-from ludwig.modules.embedding_modules import EmbedSparse
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.constants import ENCODER_OUTPUT, SET
+from ludwig.encoders.base import Encoder
+from ludwig.encoders.registry import register_encoder
+from ludwig.encoders.types import EncoderOutputDict
+from ludwig.modules.embedding_modules import EmbedSet
 from ludwig.modules.fully_connected_modules import FCStack
+from ludwig.schema.encoders.base import BaseEncoderConfig
+from ludwig.schema.encoders.set_encoders import SetSparseEncoderConfig
 
 logger = logging.getLogger(__name__)
 
 
-class SetSparseEncoder(Layer):
-
+@DeveloperAPI
+@register_encoder("embed", SET)
+class SetSparseEncoder(Encoder):
     def __init__(
-            self,
-            vocab,
-            representation='dense',
-            embedding_size=50,
-            embeddings_trainable=True,
-            pretrained_embeddings=None,
-            embeddings_on_cpu=False,
-            fc_layers=None,
-            num_fc_layers=0,
-            fc_size=10,
-            use_bias=True,
-            weights_initializer='glorot_uniform',
-            bias_initializer='zeros',
-            weights_regularizer=None,
-            bias_regularizer=None,
-            activity_regularizer=None,
-            # weights_constraint=None,
-            # bias_constraint=None,
-            norm=None,
-            norm_params=None,
-            activation='relu',
-            dropout=0.0,
-            reduce_output='sum',
-            **kwargs
+        self,
+        vocab: List[str],
+        representation: str = "dense",
+        embedding_size: int = 50,
+        embeddings_trainable: bool = True,
+        pretrained_embeddings: Optional[str] = None,
+        embeddings_on_cpu: bool = False,
+        fc_layers=None,
+        num_fc_layers: int = 0,
+        output_size: int = 10,
+        use_bias: bool = True,
+        weights_initializer: str = "xavier_uniform",
+        bias_initializer: str = "zeros",
+        norm: Optional[str] = None,
+        norm_params: Optional[Dict[str, Any]] = None,
+        activation: str = "relu",
+        dropout: float = 0.0,
+        encoder_config=None,
+        **kwargs,
     ):
-        super(SetSparseEncoder, self).__init__()
-        logger.debug(' {}'.format(self.name))
+        super().__init__()
+        self.config = encoder_config
 
-        logger.debug('  EmbedSparse')
-        self.embed_sparse = EmbedSparse(
+        logger.debug(f" {self.name}")
+
+        self.vocab_size = len(vocab)
+
+        logger.debug("  Embed")
+        self.embed = EmbedSet(
             vocab,
             embedding_size,
             representation=representation,
@@ -65,37 +72,46 @@ class SetSparseEncoder(Layer):
             embeddings_on_cpu=embeddings_on_cpu,
             dropout=dropout,
             embedding_initializer=weights_initializer,
-            embedding_regularizer=weights_regularizer,
-            reduce_output=reduce_output,
         )
 
-        logger.debug('  FCStack')
+        logger.debug("  FCStack")
+        # TODO(shreya): Make sure this is updated when FCStack is updated
         self.fc_stack = FCStack(
+            first_layer_input_size=self.embed.output_shape[-1],
             layers=fc_layers,
             num_layers=num_fc_layers,
-            default_fc_size=fc_size,
+            default_output_size=output_size,
             default_use_bias=use_bias,
             default_weights_initializer=weights_initializer,
             default_bias_initializer=bias_initializer,
-            default_weights_regularizer=weights_regularizer,
-            default_bias_regularizer=bias_regularizer,
-            default_activity_regularizer=activity_regularizer,
-            # default_weights_constraint=weights_constraint,
-            # default_bias_constraint=bias_constraint,
             default_norm=norm,
             default_norm_params=norm_params,
             default_activation=activation,
             default_dropout=dropout,
         )
 
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs: torch.Tensor) -> EncoderOutputDict:
         """
-            :param inputs: The inputs fed into the encoder.
-                   Shape: [batch x 1], type tf.int32
+        Params:
+            inputs: The inputs fed into the encoder.
+                    Shape: [batch x vocab_size], type tf.int32.
 
-            :param return: embeddings of shape [batch x embed size], type tf.float32
+        Returns:
+            Embeddings of shape [batch x vocab_size x embed size], type float32.
         """
-        hidden = self.embed_sparse(inputs, training=training, mask=mask)
-        hidden = self.fc_stack(hidden, training=training, mask=mask)
+        hidden = self.embed(inputs)
+        hidden = self.fc_stack(hidden)
 
-        return hidden
+        return {ENCODER_OUTPUT: hidden}
+
+    @staticmethod
+    def get_schema_cls() -> Type[BaseEncoderConfig]:
+        return SetSparseEncoderConfig
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([self.vocab_size])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.fc_stack.output_shape

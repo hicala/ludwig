@@ -1,6 +1,4 @@
-#! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,15 +13,17 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+from typing import List
 
 import numpy as np
-import tensorflow as tf
+import torch
 
-from ludwig.constants import *
-from ludwig.encoders.h3_encoders import H3Embed, H3WeightedSum, H3RNN
-from ludwig.features.base_feature import InputFeature
+from ludwig.constants import COLUMN, H3, PROC_COLUMN
+from ludwig.features.base_feature import BaseFeatureMixin, InputFeature
+from ludwig.schema.features.h3_feature import H3InputFeatureConfig
+from ludwig.types import FeatureMetadataDict, ModelConfigDict, PreprocessingConfigDict, TrainingSetMetadataDict
 from ludwig.utils.h3_util import h3_to_components
-from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.types import TorchscriptPreprocessingInput
 
 logger = logging.getLogger(__name__)
 
@@ -32,90 +32,128 @@ H3_VECTOR_LENGTH = MAX_H3_RESOLUTION + 4
 H3_PADDING_VALUE = 7
 
 
-class H3FeatureMixin(object):
-    type = H3
-    preprocessing_defaults = {
-        'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': 576495936675512319
-        # mode 1 edge 0 resolution 0 base_cell 0
-    }
+class _H3Preprocessing(torch.nn.Module):
+    def __init__(self, metadata: TrainingSetMetadataDict):
+        super().__init__()
+        self.max_h3_resolution = MAX_H3_RESOLUTION
+        self.h3_padding_value = H3_PADDING_VALUE
+        self.computed_fill_value = float(metadata["preprocessing"]["computed_fill_value"])
+
+    def forward(self, v: TorchscriptPreprocessingInput) -> torch.Tensor:
+        if torch.jit.isinstance(v, List[torch.Tensor]):
+            v = torch.stack(v)
+
+        if not torch.jit.isinstance(v, torch.Tensor):
+            raise ValueError(f"Unsupported input: {v}")
+
+        v = torch.nan_to_num(v, nan=self.computed_fill_value)
+        v = v.long()
+
+        outputs: List[torch.Tensor] = []
+        for v_i in v:
+            components = h3_to_components(v_i)
+            header: List[int] = [
+                components.mode,
+                components.edge,
+                components.resolution,
+                components.base_cell,
+            ]
+            cells_padding: List[int] = [self.h3_padding_value] * (self.max_h3_resolution - len(components.cells))
+            output = torch.tensor(header + components.cells + cells_padding, dtype=torch.uint8, device=v.device)
+            outputs.append(output)
+
+        return torch.stack(outputs)
+
+
+class H3FeatureMixin(BaseFeatureMixin):
+    @staticmethod
+    def type():
+        return H3
 
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
+    def cast_column(column, backend):
+        try:
+            return column.astype(int)
+        except ValueError:
+            logger.warning("H3Feature could not be read as int directly. Reading as float and converting to int.")
+            return column.astype(float).astype(int)
+
+    @staticmethod
+    def get_feature_meta(
+        config: ModelConfigDict,
+        column,
+        preprocessing_parameters: PreprocessingConfigDict,
+        backend,
+        is_input_feature: bool,
+    ) -> FeatureMetadataDict:
         return {}
 
     @staticmethod
     def h3_to_list(h3_int):
         components = h3_to_components(h3_int)
-        header = [
-            components['mode'],
-            components['edge'],
-            components['resolution'],
-            components['base_cell']
-        ]
-        cells_padding = [H3_PADDING_VALUE] * (
-                MAX_H3_RESOLUTION - len(components['cells'])
-        )
-        return header + components['cells'] + cells_padding
+        header = [components.mode, components.edge, components.resolution, components.base_cell]
+        cells_padding = [H3_PADDING_VALUE] * (MAX_H3_RESOLUTION - len(components.cells))
+        return header + components.cells + cells_padding
 
     @staticmethod
     def add_feature_data(
-            feature,
-            dataset_df,
-            dataset,
-            metadata,
-            preprocessing_parameters
+        feature_config,
+        input_df,
+        proc_df,
+        metadata,
+        preprocessing_parameters: PreprocessingConfigDict,
+        backend,
+        skip_save_processed_input,
     ):
-        column = dataset_df[feature[NAME]]
+        column = input_df[feature_config[COLUMN]]
         if column.dtype == object:
-            column = column.map(int)
-        column = column.map(H3FeatureMixin.h3_to_list)
-        dataset[feature[NAME]] = np.array(column.tolist(), dtype=np.uint8)
+            column = backend.df_engine.map_objects(column, int)
+        column = backend.df_engine.map_objects(column, H3FeatureMixin.h3_to_list)
+
+        proc_df[feature_config[PROC_COLUMN]] = backend.df_engine.map_objects(
+            column, lambda x: np.array(x, dtype=np.uint8)
+        )
+        return proc_df
 
 
 class H3InputFeature(H3FeatureMixin, InputFeature):
-    encoder = 'embed'
+    def __init__(self, input_feature_config: H3InputFeatureConfig, encoder_obj=None, **kwargs):
+        super().__init__(input_feature_config, **kwargs)
 
-    def __init__(self, feature, encoder_obj=None):
-        super().__init__(feature)
-        self.overwrite_defaults(feature)
         if encoder_obj:
             self.encoder_obj = encoder_obj
         else:
-            self.encoder_obj = self.initialize_encoder(feature)
+            self.encoder_obj = self.initialize_encoder(input_feature_config.encoder)
 
-    def call(self, inputs, training=None, mask=None):
-        assert isinstance(inputs, tf.Tensor)
-        assert inputs.dtype == tf.uint8
+    def forward(self, inputs):
+        assert isinstance(inputs, torch.Tensor)
+        assert inputs.dtype in [torch.uint8, torch.int64]
         assert len(inputs.shape) == 2
 
-        inputs_encoded = self.encoder_obj(
-            inputs, training=training, mask=mask
-        )
+        inputs_encoded = self.encoder_obj(inputs)
 
         return inputs_encoded
 
-    def get_input_dtype(self):
-        return tf.uint8
+    @property
+    def input_dtype(self):
+        return torch.uint8
 
-    def get_input_shape(self):
-        return H3_VECTOR_LENGTH,
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([H3_VECTOR_LENGTH])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.encoder_obj.output_shape
 
     @staticmethod
-    def update_config_with_metadata(
-            input_feature,
-            feature_metadata,
-            *args,
-            **kwargs
-    ):
+    def update_config_with_metadata(feature_config, feature_metadata, *args, **kwargs):
         pass
 
     @staticmethod
-    def populate_defaults(input_feature):
-        set_default_value(input_feature, TIED, None)
+    def create_preproc_module(metadata: TrainingSetMetadataDict) -> torch.nn.Module:
+        return _H3Preprocessing(metadata)
 
-    encoder_registry = {
-        'embed': H3Embed,
-        'weighted_sum': H3WeightedSum,
-        'rnn': H3RNN
-    }
+    @staticmethod
+    def get_schema_cls():
+        return H3InputFeatureConfig

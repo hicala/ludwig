@@ -2,9 +2,11 @@
 # ludwig specific #
 ###################
 
+*.lock_preprocessing
 results/
 ludwig/results/
 results_*/
+ludwig_arm64/
 
 # ailabs-utils
 ailabs_util
@@ -12,6 +14,8 @@ docker_assets
 
 # data
 mnist_data/
+profile_images/
+./profile_images/
 
 ###########
 # General #
@@ -31,11 +35,13 @@ __pycache__/
 # Distribution / packaging
 .Python
 env/
+env*
 build/
 develop-eggs/
 dist/
 downloads/
-dataset/
+./downloads/
+./dataset/
 eggs/
 .eggs/
 lib/
@@ -72,8 +78,8 @@ coverage.xml
 # Data
 *.csv
 *.hdf5
-*.json
-
+*.meta.json
+*.parquet
 
 # Translations
 *.mo
@@ -125,19 +131,12 @@ ENV/
 # PyCharm
 .idea
 
-# Exceptions
-
-!/docs/js/Ludwig_webgl1.json
-!/docs/js/Ludwig_webgl2.json
-!/docs/search/search_index.json
-!/docs/stylesheets/micon_nb/db.json
-!/mkdocs/docs/js/Ludwig_webgl1.json
-!/mkdocs/docs/js/Ludwig_webgl2.json
-!/mkdocs/docs/stylesheets/micon_nb/db.json
-
 # ctags
 tags
 
 # examples
 examples/*/data/
 examples/*/visualizations/
+
+# benchmarking configs
+ludwig/benchmarking/configs/

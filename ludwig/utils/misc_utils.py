@@ -1,6 +1,5 @@
 #! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,102 +14,58 @@
 # limitations under the License.
 # ==============================================================================
 import copy
+import functools
 import os
 import random
 import subprocess
-import subprocess as sp
-import sys
+import weakref
 from collections import OrderedDict
 from collections.abc import Mapping
+from typing import Any, Dict, TYPE_CHECKING
 
 import numpy
+import torch
 
-import ludwig.globals
-from ludwig.utils.data_utils import figure_data_format
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.constants import PROC_COLUMN
+from ludwig.globals import DESCRIPTION_FILE_NAME, MODEL_FILE_NAME
+from ludwig.utils import fs_utils
+from ludwig.utils.fs_utils import find_non_existing_dir_by_adding_suffix
 
-
-def get_experiment_description(
-        config,
-        dataset=None,
-        training_set=None,
-        validation_set=None,
-        test_set=None,
-        training_set_metadata=None,
-        data_format=None,
-        random_seed=None
-):
-    description = OrderedDict()
-    description['ludwig_version'] = ludwig.globals.LUDWIG_VERSION
-    description['command'] = ' '.join(sys.argv)
-
-    try:
-        with open(os.devnull, 'w') as devnull:
-            is_a_git_repo = subprocess.call(['git', 'branch'],
-                                            stderr=subprocess.STDOUT,
-                                            stdout=devnull) == 0
-        if is_a_git_repo:
-            description['commit_hash'] = \
-                subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode(
-                    'utf-8')[:12]
-    except:
-        pass
-
-    if random_seed is not None:
-        description['random_seed'] = random_seed
-
-    if isinstance(dataset, str):
-        description['dataset'] = dataset
-    if isinstance(training_set, str):
-        description['training_set'] = training_set
-    if isinstance(validation_set, str):
-        description['validation_set'] = validation_set
-    if isinstance(test_set, str):
-        description['test_set'] = test_set
-    if training_set_metadata is not None:
-        description['training_set_metadata'] = training_set_metadata
-
-    # determine data format if not provided or auto
-    if not data_format or data_format == 'auto':
-        data_format = figure_data_format(
-            dataset, training_set, validation_set, test_set
-        )
-
-    if data_format:
-        description['data_format'] = str(data_format)
-
-    description['config'] = config
-
-    import tensorflow as tf
-    description['tf_version'] = tf.__version__
-
-    return description
+if TYPE_CHECKING:
+    from ludwig.schema.model_types.base import ModelConfig
 
 
+@DeveloperAPI
 def set_random_seed(random_seed):
-    os.environ['PYTHONHASHSEED'] = str(random_seed)
+    os.environ["PYTHONHASHSEED"] = str(random_seed)
     random.seed(random_seed)
     numpy.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(random_seed)
 
 
+@DeveloperAPI
 def merge_dict(dct, merge_dct):
-    """ Recursive dict merge. Inspired by :meth:``dict.update()``, instead of
-    updating only top-level keys, dict_merge recurses down into dicts nested
-    to an arbitrary depth, updating keys. The ``merge_dct`` is merged into
-    ``dct``.
+    """Recursive dict merge. Inspired by :meth:``dict.update()``, instead of updating only top-level keys,
+    dict_merge recurses down into dicts nested to an arbitrary depth, updating keys. The ``merge_dct`` is merged
+    into ``dct``.
+
     :param dct: dict onto which the merge is executed
     :param merge_dct: dct merged into dct
     :return: None
     """
     dct = copy.deepcopy(dct)
     for k, v in merge_dct.items():
-        if (k in dct and isinstance(dct[k], dict)
-                and isinstance(merge_dct[k], Mapping)):
+        if k in dct and isinstance(dct[k], dict) and isinstance(merge_dct[k], Mapping):
             dct[k] = merge_dict(dct[k], merge_dct[k])
         else:
             dct[k] = merge_dct[k]
     return dct
 
 
+@DeveloperAPI
 def sum_dicts(dicts, dict_type=dict):
     summed_dict = dict_type()
     for d in dicts:
@@ -118,8 +73,7 @@ def sum_dicts(dicts, dict_type=dict):
             if key in summed_dict:
                 prev_value = summed_dict[key]
                 if isinstance(value, (dict, OrderedDict)):
-                    summed_dict[key] = sum_dicts([prev_value, value],
-                                                 dict_type=type(value))
+                    summed_dict[key] = sum_dicts([prev_value, value], dict_type=type(value))
                 elif isinstance(value, numpy.ndarray):
                     summed_dict[key] = numpy.concatenate((prev_value, value))
                 else:
@@ -129,107 +83,140 @@ def sum_dicts(dicts, dict_type=dict):
     return summed_dict
 
 
-def resolve_pointers(dict1, dict2, dict2_name):
-    resolved_dict = copy.deepcopy(dict1)
-    for key in dict1:
-        value = dict1[key]
-        if value.startswith(dict2_name):
-            key_in_dict2 = value[len(dict2_name):]
-            if key_in_dict2 in dict2.keys():
-                value = dict2[key_in_dict2]
-                resolved_dict[key] = value
-    return resolved_dict
-
-
+@DeveloperAPI
 def get_from_registry(key, registry):
-    if hasattr(key, 'lower'):
+    if hasattr(key, "lower"):
         key = key.lower()
     if key in registry:
         return registry[key]
     else:
-        raise ValueError(
-            'Key {} not supported, available options: {}'.format(
-                key, registry.keys()
-            )
-        )
+        raise ValueError(f"Key '{key}' not in registry, available options: {registry.keys()}")
 
 
+@DeveloperAPI
 def set_default_value(dictionary, key, value):
     if key not in dictionary:
         dictionary[key] = value
 
 
-def set_default_values(dictionary, default_value_dictionary):
-    # Set multiple default values
+@DeveloperAPI
+def set_default_values(dictionary: dict, default_value_dictionary: dict):
+    """This function sets multiple default values recursively for various areas of the config. By using the helper
+    function set_default_value, It parses input values that contain nested dictionaries, only setting values for
+    parameters that have not already been defined by the user.
+
+    Args:
+        dictionary (dict): The dictionary to set default values for, generally a section of the config.
+        default_value_dictionary (dict): The dictionary containing the default values for the config.
+    """
     for key, value in default_value_dictionary.items():
-        set_default_value(dictionary, key, value)
+        if key not in dictionary:  # Event where the key is not in the dictionary yet
+            dictionary[key] = value
+        elif value == {}:  # Event where dict is empty
+            set_default_value(dictionary, key, value)
+        elif isinstance(value, dict) and value:  # Event where dictionary is nested - recursive call
+            set_default_values(dictionary[key], value)
+        else:
+            set_default_value(dictionary, key, value)
 
 
-def find_non_existing_dir_by_adding_suffix(directory_name):
-    curr_directory_name = directory_name
-    suffix = 0
-    while os.path.exists(curr_directory_name):
-        curr_directory_name = directory_name + '_' + str(suffix)
-        suffix += 1
-    return curr_directory_name
-
-
+@DeveloperAPI
 def get_class_attributes(c):
-    return set(
-        i for i in dir(c)
-        if not callable(getattr(c, i)) and not i.startswith("_")
-    )
+    return {i for i in dir(c) if not callable(getattr(c, i)) and not i.startswith("_")}
 
 
-def get_available_gpu_memory():
-    _output_to_list = lambda x: x.decode('ascii').split('\n')[:-1]
-
-    COMMAND = "nvidia-smi --query-gpu=memory.free --format=csv"
-    try:
-        memory_free_info = _output_to_list(sp.check_output(COMMAND.split()))[
-                           1:]
-        memory_free_values = [int(x.split()[0])
-                              for i, x in enumerate(memory_free_info)]
-    except Exception as e:
-        print('"nvidia-smi" is probably not installed.', e)
-
-    return memory_free_values
+@DeveloperAPI
+def get_output_directory(output_directory, experiment_name, model_name="run"):
+    base_dir_name = os.path.join(output_directory, experiment_name + ("_" if model_name else "") + (model_name or ""))
+    return fs_utils.abspath(find_non_existing_dir_by_adding_suffix(base_dir_name))
 
 
-def get_output_directory(
-        output_directory,
-        experiment_name,
-        model_name='run'
-):
-    base_dir_name = os.path.join(
-        output_directory,
-        experiment_name + ('_' if model_name else '') + model_name
-    )
-    return find_non_existing_dir_by_adding_suffix(base_dir_name)
-
-
+@DeveloperAPI
 def get_file_names(output_directory):
-    description_fn = os.path.join(output_directory, 'description.json')
-    training_stats_fn = os.path.join(
-        output_directory, 'training_statistics.json')
+    description_fn = os.path.join(output_directory, DESCRIPTION_FILE_NAME)
+    training_stats_fn = os.path.join(output_directory, "training_statistics.json")
 
-    model_dir = os.path.join(output_directory, 'model')
+    model_dir = os.path.join(output_directory, MODEL_FILE_NAME)
 
     return description_fn, training_stats_fn, model_dir
 
 
-def check_which_config(config, config_file):
-    # check for config and config_file
-    if config is None and config_file is None:
-        raise ValueError(
-            'Either config of config_file have to be'
-            'not None to initialize a LudwigModel'
-        )
-    if config is not None and config_file is not None:
-        raise ValueError(
-            'Only one between config and '
-            'config_file can be provided'
-        )
-    if not config:
-        config = config_file
-    return config
+@DeveloperAPI
+def get_combined_features(config):
+    return config["input_features"] + config["output_features"]
+
+
+@DeveloperAPI
+def get_proc_features(config):
+    return get_proc_features_from_lists(config["input_features"], config["output_features"])
+
+
+@DeveloperAPI
+def get_proc_features_from_lists(*args):
+    return {feature[PROC_COLUMN]: feature for features in args for feature in features}
+
+
+@DeveloperAPI
+def set_saved_weights_in_checkpoint_flag(config_obj: "ModelConfig"):
+    """Adds a flag to all input feature encoder configs indicating that the weights are saved in the checkpoint.
+
+    Next time the model is loaded we will restore pre-trained encoder weights from ludwig model (and not load from cache
+    or model hub).
+    """
+    for input_feature in config_obj.input_features:
+        encoder_obj = input_feature.encoder
+        encoder_obj.saved_weights_in_checkpoint = True
+
+
+@DeveloperAPI
+def remove_empty_lines(str):
+    return "\n".join([line.rstrip() for line in str.split("\n") if line.rstrip()])
+
+
+# TODO(travis): move to cached_property when we drop Python 3.7.
+# https://stackoverflow.com/a/33672499
+@DeveloperAPI
+def memoized_method(*lru_args, **lru_kwargs):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapped_func(self, *args, **kwargs):
+            # We're storing the wrapped method inside the instance. If we had
+            # a strong reference to self the instance would never die.
+            self_weak = weakref.ref(self)
+
+            @functools.wraps(func)
+            @functools.lru_cache(*lru_args, **lru_kwargs)
+            def cached_method(*args, **kwargs):
+                return func(self_weak(), *args, **kwargs)
+
+            setattr(self, func.__name__, cached_method)
+            return cached_method(*args, **kwargs)
+
+        return wrapped_func
+
+    return decorator
+
+
+@DeveloperAPI
+def get_commit_hash():
+    """If Ludwig is run from a git repository, get the commit hash of the current HEAD.
+
+    Returns None if git is not executable in the current environment or Ludwig is not run in a git repo.
+    """
+    try:
+        with open(os.devnull, "w") as devnull:
+            is_a_git_repo = subprocess.call(["git", "branch"], stderr=subprocess.STDOUT, stdout=devnull) == 0
+        if is_a_git_repo:
+            commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8")
+            return commit_hash
+    except:  # noqa: E722
+        pass
+    return None
+
+
+@DeveloperAPI
+def scrub_creds(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns a copy of a config dict with all sensitive fields scrubbed."""
+    if config_dict.get("backend", {}) and "credentials" in config_dict.get("backend", {}):
+        config_dict["backend"]["credentials"] = {}
+    return config_dict

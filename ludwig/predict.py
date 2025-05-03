@@ -1,6 +1,5 @@
 #! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,39 +16,41 @@
 import argparse
 import logging
 import sys
-from typing import List, Union
+from ast import literal_eval
+from typing import List, Optional, Union
 
 import pandas as pd
 
 from ludwig.api import LudwigModel
+from ludwig.backend import ALL_BACKENDS, Backend, initialize_backend
+from ludwig.callbacks import Callback
 from ludwig.constants import FULL, TEST, TRAINING, VALIDATION
-from ludwig.contrib import contrib_command, contrib_import
+from ludwig.contrib import add_contrib_callback_args
 from ludwig.globals import LUDWIG_VERSION
-from ludwig.utils.horovod_utils import is_on_master, set_on_master
-from ludwig.utils.print_utils import logging_level_registry, print_ludwig
+from ludwig.utils.print_utils import get_logging_level_registry, print_ludwig
 
 logger = logging.getLogger(__name__)
 
 
 def predict_cli(
-        model_path: str,
-        dataset: Union[str, dict, pd.DataFrame] = None,
-        data_format: str = None,
-        split: str = FULL,
-        batch_size: int = 128,
-        skip_save_unprocessed_output: bool = False,
-        skip_save_predictions: bool = False,
-        output_directory: str = 'results',
-        gpus: Union[str, int, List[int]] = None,
-        gpu_memory_limit: int = None,
-        allow_parallel_threads: bool = True,
-        use_horovod: bool = None,
-        logging_level: int =logging.INFO,
-        debug: bool = False,
-        **kwargs
+    model_path: str,
+    dataset: Union[str, dict, pd.DataFrame] = None,
+    data_format: str = None,
+    split: str = FULL,
+    batch_size: int = 128,
+    generation_config: Optional[str] = None,
+    skip_save_unprocessed_output: bool = False,
+    skip_save_predictions: bool = False,
+    output_directory: str = "results",
+    gpus: Union[str, int, List[int]] = None,
+    gpu_memory_limit: Optional[float] = None,
+    allow_parallel_threads: bool = True,
+    callbacks: List[Callback] = None,
+    backend: Union[Backend, str] = None,
+    logging_level: int = logging.INFO,
+    **kwargs,
 ) -> None:
-    """
-    Loads pre-trained model to make predictions on the provided data set.
+    """Loads pre-trained model to make predictions on the provided data set.
 
     # Inputs
 
@@ -67,6 +68,12 @@ def predict_cli(
         to perform predictions. Valid values are `'training'`, `'validation'`,
         `'test'` and `'full'`.
     :param batch_size: (int, default `128`) size of batches for processing.
+    :param generation_config: (str, default: `None`) a string representing
+        the parameters for generation required to perform predictions with
+        an LLM. The string must be a JSON formatted dictionary with keys from
+        https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
+        These will be merged with the generation parameters from the original
+        model config.
     :param skip_save_unprocessed_output: (bool, default: `False`) by default
         predictions and their probabilities are saved in both raw
         unprocessed numpy files containing tensors and as postprocessed
@@ -79,16 +86,17 @@ def predict_cli(
         model and the training progress files.
     :param gpus: (list, default: `None`) list of GPUs that are available
         for training.
-    :param gpu_memory_limit: (int, default: `None`) maximum memory in MB to
-        allocate per GPU device.
-    :param allow_parallel_threads: (bool, default: `True`) allow TensorFlow
+    :param gpu_memory_limit: (float: default: `None`) maximum memory fraction
+        [0, 1] allowed to allocate per GPU device.
+    :param allow_parallel_threads: (bool, default: `True`) allow PyTorch
         to use multithreading parallelism to improve performance at
         the cost of determinism.
-    :param use_horovod: (bool, default: `None`) flag for using horovod.
+    :param callbacks: (list, default: `None`) a list of
+        `ludwig.callbacks.Callback` objects that provide hooks into the
+        Ludwig pipeline.
+    :param backend: (Union[Backend, str]) `Backend` or string name
+        of backend to use to execute preprocessing / training steps.
     :param logging_level: (int) Log level that will be sent to stderr.
-    :param debug: (bool, default: `False) if `True` turns on `tfdbg` with
-        `inf_or_nan` checks.
-        **kwargs:
 
     # Returns
 
@@ -97,167 +105,149 @@ def predict_cli(
     model = LudwigModel.load(
         model_path,
         logging_level=logging_level,
-        use_horovod=use_horovod,
+        backend=backend,
         gpus=gpus,
         gpu_memory_limit=gpu_memory_limit,
-        allow_parallel_threads=allow_parallel_threads
+        allow_parallel_threads=allow_parallel_threads,
+        callbacks=callbacks,
     )
     model.predict(
         dataset=dataset,
         data_format=data_format,
         split=split,
         batch_size=batch_size,
+        generation_config=literal_eval(generation_config) if generation_config else None,
         skip_save_unprocessed_output=skip_save_unprocessed_output,
         skip_save_predictions=skip_save_predictions,
         output_directory=output_directory,
-        return_type='dict',
-        debug=debug,
+        return_type="dict",
     )
 
 
 def cli(sys_argv):
     parser = argparse.ArgumentParser(
-        description='This script loads a pretrained model '
-                    'and uses it to predict',
-        prog='ludwig predict',
-        usage='%(prog)s [options]'
+        description="This script loads a pretrained model " "and uses it to predict",
+        prog="ludwig predict",
+        usage="%(prog)s [options]",
     )
 
     # ---------------
     # Data parameters
     # ---------------
+    parser.add_argument("--dataset", help="input data file path", required=True)
     parser.add_argument(
-        '--dataset',
-        help='input data file path',
-        required=True
+        "--data_format",
+        help="format of the input data",
+        default="auto",
+        choices=[
+            "auto",
+            "csv",
+            "excel",
+            "feather",
+            "fwf",
+            "hdf5",
+            "html",
+            "tables",
+            "json",
+            "jsonl",
+            "parquet",
+            "pickle",
+            "sas",
+            "spss",
+            "stata",
+            "tsv",
+        ],
     )
     parser.add_argument(
-        '--data_format',
-        help='format of the input data',
-        default='auto',
-        choices=['auto', 'csv', 'excel', 'feather', 'fwf', 'hdf5',
-                 'html' 'tables', 'json', 'jsonl', 'parquet', 'pickle', 'sas',
-                 'spss', 'stata', 'tsv']
-    )
-    parser.add_argument(
-        '-s',
-        '--split',
-        default=FULL,
-        choices=[TRAINING, VALIDATION, TEST, FULL],
-        help='the split to test the model on'
+        "-s", "--split", default=FULL, choices=[TRAINING, VALIDATION, TEST, FULL], help="the split to test the model on"
     )
 
     # ----------------
     # Model parameters
     # ----------------
-    parser.add_argument(
-        '-m',
-        '--model_path',
-        help='model to load',
-        required=True
-    )
+    parser.add_argument("-m", "--model_path", help="model to load", required=True)
+    parser.add_argument("-gc", "--generation_config", help="generation config (LLMs only)", default=None)
 
     # -------------------------
     # Output results parameters
     # -------------------------
     parser.add_argument(
-        '-od',
-        '--output_directory',
-        type=str,
-        default='results',
-        help='directory that contains the results'
+        "-od", "--output_directory", type=str, default="results", help="directory that contains the results"
     )
     parser.add_argument(
-        '-ssuo',
-        '--skip_save_unprocessed_output',
-        help='skips saving intermediate NPY output files',
-        action='store_true', default=False
+        "-ssuo",
+        "--skip_save_unprocessed_output",
+        help="skips saving intermediate NPY output files",
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
-        '-sstp',
-        '--skip_save_predictions',
-        help='skips saving predictions CSV files',
-        action='store_true', default=False
+        "-sstp",
+        "--skip_save_predictions",
+        help="skips saving predictions CSV files",
+        action="store_true",
+        default=False,
     )
 
     # ------------------
     # Generic parameters
     # ------------------
-    parser.add_argument(
-        '-bs',
-        '--batch_size',
-        type=int,
-        default=128,
-        help='size of batches'
-    )
+    parser.add_argument("-bs", "--batch_size", type=int, default=128, help="size of batches")
 
     # ------------------
     # Runtime parameters
     # ------------------
+    parser.add_argument("-g", "--gpus", type=int, default=0, help="list of gpu to use")
     parser.add_argument(
-        '-g',
-        '--gpus',
-        type=int,
-        default=0,
-        help='list of gpu to use'
-    )
-    parser.add_argument(
-        '-gml',
-        '--gpu_memory_limit',
-        type=int,
+        "-gml",
+        "--gpu_memory_limit",
+        type=float,
         default=None,
-        help='maximum memory in MB to allocate per GPU device'
+        help="maximum memory fraction [0, 1] allowed to allocate per GPU device",
     )
     parser.add_argument(
-        '-dpt',
-        '--disable_parallel_threads',
-        action='store_false',
-        dest='allow_parallel_threads',
-        help='disable TensorFlow from using multithreading for reproducibility'
+        "-dpt",
+        "--disable_parallel_threads",
+        action="store_false",
+        dest="allow_parallel_threads",
+        help="disable PyTorch from using multithreading for reproducibility",
     )
     parser.add_argument(
-        '-uh',
-        '--use_horovod',
-        action='store_true',
-        default=None,
-        help='uses horovod for distributed training'
+        "-b",
+        "--backend",
+        help="specifies backend to use for parallel / distributed execution, "
+        "defaults to local execution or Horovod if called using horovodrun",
+        choices=ALL_BACKENDS,
     )
     parser.add_argument(
-        '-dbg',
-        '--debug',
-        action='store_true',
-        default=False,
-        help='enables debugging mode'
-    )
-    parser.add_argument(
-        '-l',
-        '--logging_level',
-        default='info',
-        help='the level of logging to use',
-        choices=['critical', 'error', 'warning', 'info', 'debug', 'notset']
+        "-l",
+        "--logging_level",
+        default="info",
+        help="the level of logging to use",
+        choices=["critical", "error", "warning", "info", "debug", "notset"],
     )
 
+    add_contrib_callback_args(parser)
     args = parser.parse_args(sys_argv)
 
-    args.logging_level = logging_level_registry[args.logging_level]
-    logging.getLogger('ludwig').setLevel(
-        args.logging_level
-    )
+    args.callbacks = args.callbacks or []
+    for callback in args.callbacks:
+        callback.on_cmdline("predict", *sys_argv)
+
+    args.logging_level = get_logging_level_registry()[args.logging_level]
+    logging.getLogger("ludwig").setLevel(args.logging_level)
     global logger
-    logger = logging.getLogger('ludwig.predict')
+    logger = logging.getLogger("ludwig.predict")
 
-    set_on_master(args.use_horovod)
-
-    if is_on_master():
-        print_ludwig('Predict', LUDWIG_VERSION)
-        logger.info('Dataset path: {}'.format(args.dataset))
-        logger.info('Model path: {}'.format(args.model_path))
-        logger.info('')
+    args.backend = initialize_backend(args.backend)
+    if args.backend.is_coordinator():
+        print_ludwig("Predict", LUDWIG_VERSION)
+        logger.info(f"Dataset path: {args.dataset}")
+        logger.info(f"Model path: {args.model_path}")
+        logger.info("")
 
     predict_cli(**vars(args))
 
 
-if __name__ == '__main__':
-    contrib_import()
-    contrib_command("predict", *sys.argv)
+if __name__ == "__main__":
     cli(sys.argv[1:])

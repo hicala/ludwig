@@ -1,5 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,405 +12,259 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import numpy as np
-import tensorflow as tf
-import tensorflow_addons as tfa
-from tensorflow.python.keras.losses import MeanAbsoluteError, MeanSquaredError
 
-from ludwig.constants import *
+
+from typing import Type
+
+import torch
+from torch import nn, Tensor
+from torch.nn import HuberLoss as _HuberLoss
+from torch.nn import L1Loss
+from torch.nn import MSELoss as _MSELoss
+from torchmetrics.functional import mean_absolute_percentage_error
+
+import ludwig.utils.loss_utils as utils
 from ludwig.constants import LOGITS
-from ludwig.utils.tf_utils import sequence_length_2D
+from ludwig.modules.loss_implementations.corn import corn_loss
+from ludwig.schema.features.loss.loss import (
+    BaseLossConfig,
+    BWCEWLossConfig,
+    CORNLossConfig,
+    HuberLossConfig,
+    MAELossConfig,
+    MAPELossConfig,
+    MSELossConfig,
+    NextTokenSoftmaxCrossEntropyLossConfig,
+    RMSELossConfig,
+    RMSPELossConfig,
+    SequenceSoftmaxCrossEntropyLossConfig,
+    SigmoidCrossEntropyLossConfig,
+    SoftmaxCrossEntropyLossConfig,
+)
+from ludwig.utils import strings_utils
+from ludwig.utils.registry import Registry
+
+# used for Laplace smoothing for candidate samplers
+EPSILON = 1.0e-10
+
+loss_impl_registry = Registry[Type[nn.Module]]()
 
 
-class MSELoss(MeanSquaredError):
-    def __init__(self, **kwargs):
-        super(MSELoss, self).__init__(**kwargs)
+def register_loss(config_cls: Type[BaseLossConfig]):
+    def wrap(cls: Type[nn.Module]):
+        loss_impl_registry[config_cls] = cls
+        return cls
 
-    def __call__(self, y_true, y_pred, sample_weight=None):
-        logits = y_pred[LOGITS]
-        loss = super().__call__(y_true, logits, sample_weight=sample_weight)
+    return wrap
+
+
+def create_loss(config: BaseLossConfig) -> nn.Module:
+    return loss_impl_registry[type(config)](config)
+
+
+class LogitsInputsMixin:
+    @classmethod
+    def get_loss_inputs(cls):
+        """Maps loss to the desired predicted input type."""
+        return LOGITS
+
+
+@register_loss(MSELossConfig)
+class MSELoss(_MSELoss, LogitsInputsMixin):
+    """Mean squared error."""
+
+    def __init__(self, config: MSELossConfig):
+        super().__init__()
+
+
+@register_loss(MAELossConfig)
+class MAELoss(L1Loss, LogitsInputsMixin):
+    """Mean absolute error."""
+
+    def __init__(self, config: MAELossConfig):
+        super().__init__()
+
+
+@register_loss(MAPELossConfig)
+class MAPELoss(nn.Module, LogitsInputsMixin):
+    """Mean absolute error."""
+
+    def __init__(self, config: MAPELossConfig):
+        super().__init__()
+
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        return mean_absolute_percentage_error(preds, target)
+
+
+@register_loss(RMSELossConfig)
+class RMSELoss(nn.Module, LogitsInputsMixin):
+    """Root mean square error."""
+
+    def __init__(self, config: RMSELossConfig):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        return torch.sqrt(self.mse(preds, target))
+
+
+@register_loss(RMSPELossConfig)
+class RMSPELoss(nn.Module, LogitsInputsMixin):
+    """Root mean square percentage error."""
+
+    def __init__(self, config: RMSPELossConfig):
+        super().__init__()
+
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        loss = utils.rmspe_loss(target, preds)
         return loss
 
 
-class MAELoss(MeanAbsoluteError):
-    def __init__(self, **kwargs):
-        super(MAELoss, self).__init__(**kwargs)
+@register_loss(BWCEWLossConfig)
+class BWCEWLoss(nn.Module, LogitsInputsMixin):
+    """Binary weighted cross entropy loss."""
 
-    def __call__(self, y_true, y_pred, sample_weight=None):
-        logits = y_pred[LOGITS]
-        loss = super().__call__(y_true, logits, sample_weight=sample_weight)
-        return loss
+    def __init__(self, config: BWCEWLossConfig):
+        super().__init__()
+        if config.positive_class_weight:
+            self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([config.positive_class_weight]))
+        else:
+            self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=config.positive_class_weight)
+        self.robust_lambda = config.robust_lambda
+        self.confidence_penalty = config.confidence_penalty
 
-
-class BWCEWLoss(tf.keras.losses.Loss):
-    def __init__(
-            self,
-            positive_class_weight=1,
-            robust_lambda=0,
-            confidence_penalty=0
-    ):
-        super(BWCEWLoss, self).__init__()
-
-        self.positive_class_weight = positive_class_weight
-        self.robust_lambda = robust_lambda
-        self.confidence_penalty = confidence_penalty
-
-    def call(self, y_true, y_pred):
-        logits = y_pred[LOGITS]
-
-        # weighted cross entropy
-        train_loss = tf.nn.weighted_cross_entropy_with_logits(
-            labels=tf.cast(y_true, tf.float32),
-            logits=logits,
-            pos_weight=self.positive_class_weight
-        )
-
+    def forward(self, preds: torch.Tensor, target: torch.Tensor):
+        train_loss = self.loss_fn(preds, target.float())
         # robust lambda
         if self.robust_lambda > 0:
-            train_loss = ((1 - self.robust_lambda) * train_loss +
-                          self.robust_lambda / 2)
+            train_loss = (1 - self.robust_lambda) * train_loss + self.robust_lambda / 2
 
-        train_mean_loss = tf.reduce_mean(
-            train_loss
-        )
+        train_mean_loss = torch.mean(train_loss)
 
         # confidence penalty
         if self.confidence_penalty > 0:
-            probabilities = tf.nn.sigmoid(logits)
-            mean_penalty = mean_confidence_penalty(probabilities, 2)
+            probabilities = torch.sigmoid(preds)
+            mean_penalty = utils.mean_confidence_penalty(probabilities, 2)
             train_mean_loss += self.confidence_penalty * mean_penalty
 
         return train_mean_loss
 
 
-class SoftmaxCrossEntropyLoss(tf.keras.losses.Loss):
-    def __init__(
-            self,
-            num_classes=0,
-            feature_loss=None,
-            name=None
-    ):
-        super(SoftmaxCrossEntropyLoss, self).__init__(name=name)
-        self.num_classes = num_classes
-        self.feature_loss = feature_loss
-
-    def call(self, y, y_pred):
-        vector_labels = tf.one_hot(
-            tf.cast(y, dtype=tf.int64),
-            self.num_classes
-        )
-
-        loss = weighted_softmax_cross_entropy(
-            y_pred[LOGITS],
-            vector_labels,
-            **self.feature_loss
-        )
-
-        return loss
-
-
-class SampledSoftmaxCrossEntropyLoss(tf.keras.losses.Loss):
-    def __init__(
-            self,
-            decoder_obj=None,
-            num_classes=0,
-            feature_loss=None,
-            name=None
-    ):
-        super(SampledSoftmaxCrossEntropyLoss, self).__init__(name=name)
-
-        self.decoder_obj = decoder_obj
-        self.num_classes = num_classes
-        self.feature_loss = feature_loss
-
-    def call(self, y, y_pred):
-        decoder_weights = self.decoder_obj.weights[0]
-        decoder_biases = self.decoder_obj.weights[1]
-
-        loss = sampled_softmax_cross_entropy(
-            y,
-            y_pred[LAST_HIDDEN],
-            num_classes=self.num_classes,
-            decoder_weights=decoder_weights,
-            decoder_biases=decoder_biases,
-            **self.feature_loss
-        )
-
-        return loss
-
-
-class SigmoidCrossEntropyLoss(tf.keras.losses.Loss):
-    def __init__(
-            self,
-            name=None
-    ):
-        super(SigmoidCrossEntropyLoss, self).__init__(name=name)
-
-    def call(self, y, y_pred):
-        loss = tf.nn.sigmoid_cross_entropy_with_logits(
-            labels=tf.cast(y, tf.float32),
-            logits=y_pred[LOGITS]
-        )
-
-        return loss
-
-
-class SequenceLoss(tf.keras.losses.Loss):
-    def __init__(self, name=None, from_logits=True, **kwargs):
-        super(SequenceLoss, self).__init__(name=name)
-        self.loss_function = tf.keras.losses.SparseCategoricalCrossentropy(
-            from_logits=from_logits,
-            reduction='none'
-        )
-        self.from_logits = from_logits
-
-    def call(self, y_true, y_pred):
-        # y_true: shape [batch_size, sequence_size]
-        # y_pred: shape [batch_size, sequence_size, num_classes]
-
-        if self.from_logits:
-            y_pred_tensor = y_pred[LOGITS]
+@register_loss(SoftmaxCrossEntropyLossConfig)
+class SoftmaxCrossEntropyLoss(nn.Module, LogitsInputsMixin):
+    def __init__(self, config: SoftmaxCrossEntropyLossConfig):
+        """
+        Params:
+            class_weights: List or 1D tensor of length equal to number of classes.
+        """
+        super().__init__()
+        if config.class_weights:
+            self.loss_fn = nn.CrossEntropyLoss(weight=torch.Tensor(config.class_weights))
         else:
-            y_pred_tensor = y_pred[PROBABILITIES]
-        y_true_tensor = tf.cast(y_true, dtype=tf.int64)
+            self.loss_fn = nn.CrossEntropyLoss()
 
-        # pad the shorter sequence (tensor shape 1)
-        y_pred_tensor_len = tf.shape(y_pred_tensor)[1]
-        y_true_tensor_len = tf.shape(y_true_tensor)[1]
-
-        y_pred_pad_len = tf.maximum(0, y_true_tensor_len - y_pred_tensor_len)
-        y_true_pad_len = tf.maximum(0, y_pred_tensor_len - y_true_tensor_len)
-
-        y_pred_tensor = tf.pad(y_pred_tensor,
-                               [[0, 0], [0, y_pred_pad_len], [0, 0]])
-        y_true_tensor = tf.pad(y_true_tensor, [[0, 0], [0, y_true_pad_len]])
-
-        y_true_seq_len = sequence_length_2D(y_true_tensor)
-        # longest_sequence_length = tf.maximum(y_true_seq_len,
-        #                                     sequence_length_3D(y_pred_tensor))
-        # longest_sequence_length = tf.minimum(longest_sequence_length,
-        #                                     y_true_seq_len)
-        # longest_sequence_length += 2  # for EOS
-
-        mask = tf.sequence_mask(
-            y_true_seq_len + 1,  # this is for including the eos
-            # in case of generator and shouldn't impact
-            # negatively in case of tagger
-            maxlen=tf.shape(y_true_tensor)[1],
-            dtype=tf.float32
-        )
-        # compute loss based on valid time steps
-        loss = self.loss_function(y_true_tensor, y_pred_tensor)
-        loss = loss * mask
-        loss = tf.reduce_sum(loss) / tf.reduce_sum(mask)
-        return loss
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        """
+        Params:
+            preds: Tensor of shape [batch x num_classes]
+                          or shape [batch x num_classes x H x W]
+            target: Tensor of shape [batch], where each element is integral
+                between 0 and num_classes.
+                           or shape [batch x H x W], where each element is integral
+                between 0 and num_classes.
+        """
+        if len(target.shape) == 1 or len(target.shape) == 3:
+            # Assumes we are providing the target as a single class, rather than a distribution
+            # The target shape can be a 3D tensor [batch x H x W], for image segmentation
+            target = target.long()
+        return self.loss_fn(preds, target)
 
 
-def softmax_cross_entropy_with_class_weighting(logits, one_hot_labels,
-                                               class_weights,
-                                               labels_smoothing=0.0):
-    class_weights_const = tf.expand_dims(
-        tf.constant(class_weights, dtype=tf.float32), 0)
-    sample_weights = tf.reduce_sum(
-        tf.multiply(one_hot_labels, class_weights_const), 1)
-    return tf.losses.softmax_cross_entropy(onehot_labels=one_hot_labels,
-                                           logits=logits,
-                                           label_smoothing=labels_smoothing,
-                                           weights=sample_weights,
-                                           reduction=tf.losses.Reduction.NONE)
+@register_loss(SequenceSoftmaxCrossEntropyLossConfig)
+class SequenceSoftmaxCrossEntropyLoss(nn.Module, LogitsInputsMixin):
+    def __init__(self, config: SequenceSoftmaxCrossEntropyLossConfig):
+        """
+        Params:
+            class_weights: List or 1D tensor of length equal to number of classes.
+        """
+        super().__init__()
+        if config.class_weights:
+            self.loss_fn = nn.CrossEntropyLoss(
+                weight=torch.Tensor(config.class_weights), ignore_index=strings_utils.SpecialSymbol.PADDING.value
+            )
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(ignore_index=strings_utils.SpecialSymbol.PADDING.value)
+
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        """
+        Params:
+            preds: Tensor of shape [batch x sequence_length x vocab_size]
+            target: Tensor of shape [batch x sequence_length], where each element is integral between 0 and vocab_size.
+        """
+        target = target.long()
+        return self.loss_fn(preds[1:].view(-1, preds.size(-1)), target[1:].view(-1))
 
 
-def sigmoid_cross_entropy_with_class_weighting(logits, multi_class_labels,
-                                               class_weights,
-                                               labels_smoothing=0.0):
-    class_weights_const = tf.expand_dims(
-        tf.constant(class_weights, dtype=tf.float32), 0)
-    sample_weights = tf.reduce_sum(
-        tf.multiply(multi_class_labels, class_weights_const), 1)
-    return tf.losses.sigmoid_cross_entropy(
-        multi_class_labels=multi_class_labels,
-        logits=logits,
-        label_smoothing=labels_smoothing,
-        weights=sample_weights,
-        reduction=tf.losses.Reduction.NONE)
+@register_loss(NextTokenSoftmaxCrossEntropyLossConfig)
+class NextTokenSoftmaxCrossEntropyLoss(nn.Module, LogitsInputsMixin):
+    def __init__(self, config: NextTokenSoftmaxCrossEntropyLossConfig):
+        super().__init__()
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        """
+        Params:
+            preds: Tensor of shape [batch x sequence_length x vocab_size]
+            target: Tensor of shape [batch x sequence_length], where each element is integral between 0 and vocab_size.
+
+        Reference implementation:
+        https://github.com/huggingface/transformers/blob/v4.29.1/src/transformers/models/bert/modeling_bert.py#LL1253C1-L1260C1 # noqa
+        """
+        target = target.long()
+        _, _, vocab_size = preds.shape
+        # logits for all tensors except n+1 since each logit tensor at position i represents the log probabilities for
+        # the next token i+1 if we were to do argmax on the logits ensor at position i.
+        shifted_predictions = preds[:, :-1, :]
+        # Shift by 1 since the logits at position 0 in predictions represent the log likelihood of target token 1
+        shifted_targets = target[:, 1:]
+        return self.loss_fn(shifted_predictions.reshape(-1, vocab_size), shifted_targets.reshape(-1))
 
 
-def mean_confidence_penalty(probabilities, num_classes):
-    max_entropy = tf.constant(np.log(num_classes), dtype=tf.float32)
-    # clipping needed for avoiding log(0) = -inf
-    entropy_per_class = tf.maximum(- probabilities *
-                                   tf.log(
-                                       tf.clip_by_value(probabilities, 1e-10,
-                                                        1)), 0)
-    entropy = tf.reduce_sum(entropy_per_class, -1)
-    penalty = (max_entropy - entropy) / max_entropy
-    return tf.reduce_mean(penalty)
+@register_loss(SigmoidCrossEntropyLossConfig)
+class SigmoidCrossEntropyLoss(nn.Module, LogitsInputsMixin):
+    def __init__(self, config: SigmoidCrossEntropyLossConfig):
+        """
+        Params:
+            class_weights: List or 1D tensor of length equal to number of classes.
+        """
+        super().__init__()
+        if config.class_weights:
+            self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor(config.class_weights))
+        else:
+            self.loss_fn = nn.BCEWithLogitsLoss()
+
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        if preds.ndim != 2:
+            raise RuntimeError("SigmoidCrossEntropyLoss currently only supported for 2D tensors.")
+
+        return self.loss_fn(preds.type(torch.float32), target.type(torch.float32))
 
 
-def sampled_softmax_cross_entropy(
-        labels,
-        last_hidden,
-        num_classes=1,
-        decoder_weights=None,
-        decoder_biases=None,
-        sampler=None,
-        negative_samples=0,
-        class_counts=0,
-        distortion=1,
-        unique=False,
-        **kwargs
-):
-    labels = tf.cast(
-        tf.expand_dims(labels, -1),
-        tf.int64
-    )
-    sampled_values = sample_values_from_classes(labels, sampler, num_classes,
-                                                negative_samples, unique,
-                                                class_counts, distortion)
-    train_loss = tf.nn.sampled_softmax_loss(
-        weights=tf.transpose(decoder_weights),
-        biases=decoder_biases,
-        labels=labels,
-        inputs=last_hidden,
-        num_sampled=negative_samples,
-        num_classes=num_classes,
-        sampled_values=sampled_values)
+@register_loss(HuberLossConfig)
+class HuberLoss(_HuberLoss, LogitsInputsMixin):
+    """Huber loss."""
 
-    return train_loss
+    def __init__(self, config: HuberLossConfig):
+        super().__init__(delta=config.delta)
 
 
-def sequence_sampled_softmax_cross_entropy(targets, targets_sequence_length,
-                                           eval_logits, train_logits,
-                                           class_weights,
-                                           class_biases, loss,
-                                           num_classes):
-    batch_max_targets_sequence_length = tf.shape(targets)[1]
+@register_loss(CORNLossConfig)
+class CORNLoss(nn.Module, LogitsInputsMixin):
+    """CORN loss."""
 
-    batch_max_train_logits_sequence_length = tf.shape(train_logits)[1]
-    difference_train = batch_max_targets_sequence_length - batch_max_train_logits_sequence_length
-    padded_train_logits = tf.pad(train_logits,
-                                 [[0, 0], [0, difference_train], [0, 0]])
+    def __init__(self, config: CORNLossConfig):
+        super().__init__()
 
-    batch_max_eval_logits_sequence_length = tf.shape(eval_logits)[1]
-    difference_eval = batch_max_targets_sequence_length - batch_max_eval_logits_sequence_length
-    padded_eval_logits = tf.pad(eval_logits,
-                                [[0, 0], [0, difference_eval], [0, 0]])
-
-    # batch_max_seq_length = tf.shape(train_logits)[1]
-    # unpadded_targets = targets[:, :batch_max_seq_length]
-    # output_exp = tf.cast(tf.reshape(unpadded_targets, [-1, 1]), tf.int64)
-    output_exp = tf.cast(tf.reshape(targets, [-1, 1]), tf.int64)
-    sampled_values = sample_values_from_classes(output_exp, loss['sampler'],
-                                                num_classes,
-                                                loss['negative_samples'],
-                                                loss['unique'],
-                                                loss['class_counts'],
-                                                loss['distortion'])
-
-    def _sampled_loss(labels, logits):
-        labels = tf.cast(labels, tf.int64)
-        labels = tf.reshape(labels, [-1, 1])
-        logits = tf.cast(logits, tf.float32)
-
-        return tf.cast(
-            tf.nn.sampled_softmax_loss(weights=tf.transpose(class_weights),
-                                       biases=class_biases,
-                                       labels=labels,
-                                       inputs=logits,
-                                       num_sampled=loss['negative_samples'],
-                                       num_classes=num_classes,
-                                       sampled_values=sampled_values),
-            tf.float32)
-
-    train_loss = tfa.seq2seq.sequence_loss(
-        padded_train_logits,
-        targets,
-        tf.sequence_mask(targets_sequence_length,
-                         batch_max_targets_sequence_length, dtype=tf.float32),
-        average_across_timesteps=True,
-        average_across_batch=False,
-        softmax_loss_function=_sampled_loss
-    )
-
-    # batch_max_seq_length_eval = tf.shape(eval_logits)[1]
-    # unpadded_targets_eval = targets[:, :batch_max_seq_length_eval]
-
-    eval_loss = tfa.seq2seq.sequence_loss(
-        padded_eval_logits,
-        targets,
-        tf.sequence_mask(targets_sequence_length,
-                         batch_max_targets_sequence_length, dtype=tf.float32),
-        average_across_timesteps=True,
-        average_across_batch=False
-    )
-
-    return train_loss, eval_loss
-
-
-def weighted_softmax_cross_entropy(
-        logits,
-        vector_labels,
-        class_weights=1,
-        labels_smoothing=0,
-        **kwargs
-):
-    use_class_weights = not isinstance(class_weights, (int, float))
-    if use_class_weights:
-        train_loss = softmax_cross_entropy_with_class_weighting(
-            logits,
-            vector_labels,
-            class_weights,
-            labels_smoothing
-        )
-    else:
-        train_loss = tf.keras.losses.categorical_crossentropy(
-            y_true=vector_labels,
-            y_pred=logits,
-            from_logits=True,
-            label_smoothing=labels_smoothing
-        )
-    return train_loss
-
-
-def sample_values_from_classes(labels, sampler, num_classes, negative_samples,
-                               unique, class_counts, distortion):
-    """returns sampled_values using the chosen sampler"""
-    if sampler == 'fixed_unigram':
-        sampled_values = tf.random.fixed_unigram_candidate_sampler(
-            true_classes=labels,
-            num_true=1,
-            num_sampled=negative_samples,
-            unique=unique,
-            range_max=num_classes,
-            unigrams=class_counts,
-            distortion=distortion
-        )
-    elif sampler == 'uniform':
-        sampled_values = tf.random.uniform_candidate_sampler(
-            true_classes=labels,
-            num_true=1,
-            num_sampled=negative_samples,
-            unique=unique,
-            range_max=num_classes
-        )
-    elif sampler == 'log_uniform':
-        sampled_values = tf.random.log_uniform_candidate_sampler(
-            true_classes=labels,
-            num_true=1,
-            num_sampled=negative_samples,
-            unique=unique,
-            range_max=num_classes
-        )
-    elif sampler == 'learned_unigram':
-        sampled_values = tf.random.fixed_unigram_candidate_sampler(
-            true_classes=labels,
-            num_true=1,
-            num_sampled=negative_samples,
-            unique=unique,
-            range_max=num_classes,
-            unigrams=class_counts,
-            distortion=distortion
-        )
-    else:
-        raise ValueError('Unsupported sampler {}'.format(sampler))
-    return sampled_values
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
+        num_classes = preds.shape[1]
+        return corn_loss(preds, target, num_classes=num_classes)

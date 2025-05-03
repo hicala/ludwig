@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,25 +15,31 @@
 import random
 
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
 
+from ludwig.constants import ENCODER_OUTPUT
 from ludwig.data.dataset_synthesizer import build_vocab
-from ludwig.encoders.image_encoders import ResNetEncoder, Stacked2DCNN
-from ludwig.encoders.sequence_encoders import ParallelCNN
-from ludwig.encoders.sequence_encoders import SequenceEmbedEncoder
-from ludwig.encoders.sequence_encoders import StackedCNN
-from ludwig.encoders.sequence_encoders import StackedCNNRNN
-from ludwig.encoders.sequence_encoders import StackedParallelCNN
-from ludwig.encoders.sequence_encoders import StackedRNN
+from ludwig.encoders.base import Encoder
+from ludwig.encoders.image.base import MLPMixerEncoder, Stacked2DCNN
+from ludwig.encoders.sequence_encoders import (
+    ParallelCNN,
+    SequenceEmbedEncoder,
+    StackedCNN,
+    StackedCNNRNN,
+    StackedParallelCNN,
+    StackedRNN,
+)
+from ludwig.utils.torch_utils import get_torch_device
+from tests.integration_tests.parameter_update_utils import check_module_parameters_updated
 
-L1_REGULARIZER = 'l1'
-L2_REGULARIZER = 'l2'
-NO_REGULARIZER = None
 DROPOUT = 0.5
+DEVICE = get_torch_device()
+RANDOM_SEED = 1919
 
 
-def create_encoder(encoder_type, encoder_args={}):
-    encoder = encoder_type(**encoder_args)
+def create_encoder(encoder_type, **encoder_kwargs):
+    encoder = encoder_type(**encoder_kwargs)
     return encoder
 
 
@@ -49,8 +54,7 @@ def generate_images(image_size, num_images):
 def _generate_sentence(vocab_size, max_len):
     sentence = np.zeros(max_len, dtype=np.int32)
     random_length = random.randint(1, max_len)
-    sentence[:random_length] = [random.randint(0, vocab_size - 1) for _ in
-                                range(random_length)]
+    sentence[:random_length] = [random.randint(0, vocab_size - 1) for _ in range(random_length)]
 
     return sentence
 
@@ -59,21 +63,20 @@ def generate_random_sentences(num_sentences=10, max_len=10, vocab_size=10):
     # Generate some random text
     vocab = build_vocab(vocab_size)
 
-    text = np.array([_generate_sentence(vocab_size, max_len)
-                     for _ in range(num_sentences)])
+    text = np.array([_generate_sentence(vocab_size, max_len) for _ in range(num_sentences)])
 
     return text, vocab
 
 
 def encoder_test(
-        encoder,
-        input_data,
-        output_dtype,
-        output_shape,
-        output_data=None,
+    encoder,
+    input_data,
+    output_dtype,
+    output_shape,
+    output_data=None,
 ):
-    """
-    Helper method to test different kinds of encoders
+    """Helper method to test different kinds of encoders.
+
     :param encoder: encoder object
     :param input_data: data to encode
     :param output_dtype: expected data type of the output (optional)
@@ -81,108 +84,51 @@ def encoder_test(
     :param output_data: expected output data (optional)
     :return: returns the encoder object for the caller to run extra checks
     """
-    # Run the encoder
-    input_data = tf.convert_to_tensor(input_data)
+    encoder = encoder.to(DEVICE)
 
-    hidden = encoder(
-        input_data,
-        training=False
-    )['encoder_output']
+    # Run the encoder
+    input_data = torch.from_numpy(input_data).to(DEVICE)
+
+    hidden = encoder(input_data)[ENCODER_OUTPUT]
 
     # Check output shape and type
     assert hidden.dtype == output_dtype
-    assert hidden.shape.as_list() == output_shape
+    assert list(hidden.shape) == output_shape
 
     if output_data is not None:
         # todo the hidden output is actually a tensor. May need modification
         assert np.allclose(hidden, output_data)
 
 
-def test_image_encoders_resnet():
-    # Test the resnet encoder for images
-    encoder_args = {
-        'resnet_size': 8, 'num_filters': 8, 'fc_size': 28,
-        'weights_regularizer': L1_REGULARIZER,
-        'bias_regularizer': L1_REGULARIZER,
-        'activity_regularizer': L1_REGULARIZER,
-        'dropout': DROPOUT
-    }
-    image_size = (10, 10, 3)
-
-    output_shape = [1, 28]
-    input_image = generate_images(image_size, 1)
-
-    encoder = create_encoder(ResNetEncoder, encoder_args)
-    encoder_test(
-        encoder=encoder,
-        input_data=input_image,
-        output_dtype=np.float,
-        output_shape=output_shape,
-        output_data=None
-    )
-
-    output_shape = [5, 28]
-    input_images = generate_images(image_size, 5)
-
-    encoder_test(
-        encoder=encoder,
-        input_data=input_images,
-        output_dtype=np.float,
-        output_shape=output_shape,
-        output_data=None
-    )
-
-    assert encoder is not None
-    assert encoder.resnet.__class__.__name__ == 'ResNet2'
-    assert encoder.resnet.num_filters == 8
-    assert encoder.resnet.resnet_size == 8
-    assert encoder.resnet.filter_size == 3
-    assert encoder.flatten.__class__.__name__ == 'Flatten'
-    assert encoder.fc_stack.__class__.__name__ == 'FCStack'
-    assert len(encoder.fc_stack.layers) == 1
-    assert encoder.fc_stack.layers[0]['fc_size'] == 28
-    assert encoder.fc_stack.layers[0]['activation'] == 'relu'
-
-
 def test_image_encoders_stacked_2dcnn():
+    # make repeatable
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+
     # Test the resnet encoder for images
-    encoder_args = {
-        'num_conv_layers': 2, 'num_filters': 16, 'fc_size': 28,
-        'conv_activity_regularizer': L1_REGULARIZER,
-        'conv_weights_regularizer': L1_REGULARIZER,
-        'conv_bias_regularizer': L1_REGULARIZER,
-        'fc_activity_regularizer': L1_REGULARIZER,
-        'fc_weights_regularizer': L1_REGULARIZER,
-        'fc_bias_regularizer': L1_REGULARIZER,
-        'dropout': DROPOUT
+    encoder_kwargs = {"num_conv_layers": 2, "num_filters": 16, "output_size": 28, "dropout": DROPOUT}
+    image_size = (3, 10, 10)
 
-    }
-    image_size = (10, 10, 3)
-
-    encoder = create_encoder(Stacked2DCNN, encoder_args)
+    encoder = create_encoder(
+        Stacked2DCNN, num_channels=image_size[0], height=image_size[1], width=image_size[2], **encoder_kwargs
+    )
 
     assert encoder is not None
     assert encoder.conv_stack_2d is not None
-    assert encoder.conv_stack_2d.layers[0]['filter_size'] == 3
-    assert encoder.fc_stack.layers[0]['fc_size'] == 28
+    assert list(encoder.conv_stack_2d.output_shape) == [32, 1, 1]
     assert len(encoder.fc_stack.layers) == 1
-    assert encoder.conv_stack_2d.layers[0]['num_filters'] == 16
-    assert encoder.conv_stack_2d.layers[0]['pool_size'] == (2, 2)
-    assert encoder.conv_stack_2d.layers[0]['strides'] == (1, 1)
-    assert encoder.conv_stack_2d.layers[0]['pool_strides'] is None
-    assert encoder.conv_stack_2d.layers[0]['norm'] is None
-    assert encoder.fc_stack.layers[0]['activation'] == 'relu'
-    assert encoder.conv_stack_2d.layers[-1]['dropout'] == 0
+    assert encoder.conv_stack_2d.layers[0]["pool_kernel_size"] == 2
+    assert encoder.conv_stack_2d.layers[0]["stride"] == 1
+    assert encoder.conv_stack_2d.layers[0]["pool_stride"] == 2
+    assert encoder.conv_stack_2d.layers[0]["norm"] is None
+    assert encoder.conv_stack_2d.layers[0]["activation"] == "relu"
+    assert encoder.conv_stack_2d.layers[0]["dropout"] == 0
 
     output_shape = [1, 28]
     input_image = generate_images(image_size, 1)
 
     encoder_test(
-        encoder=encoder,
-        input_data=input_image,
-        output_dtype=np.float,
-        output_shape=output_shape,
-        output_data=None
+        encoder=encoder, input_data=input_image, output_dtype=torch.float32, output_shape=output_shape, output_data=None
     )
 
     output_shape = [5, 28]
@@ -191,9 +137,78 @@ def test_image_encoders_stacked_2dcnn():
     encoder_test(
         encoder=encoder,
         input_data=input_images,
-        output_dtype=np.float,
+        output_dtype=torch.float32,
         output_shape=output_shape,
-        output_data=None
+        output_data=None,
+    )
+
+    # test for parameter updates
+    # generate tensors for parameter update test
+    target = torch.rand(output_shape)
+    image_tensor = torch.rand(input_image.shape)
+
+    # check for parameter updates
+    fpc, tpc, upc, not_updated = check_module_parameters_updated(encoder, (image_tensor,), target)
+    assert upc == tpc, (
+        f"Not all trainable parameters updated.  Parameters not updated: {not_updated}."
+        f"  Module structure\n{encoder}"
+    )
+
+
+def test_image_encoders_mlpmixer():
+    # make repeatable
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+
+    # Test the resnet encoder for images
+    encoder_kwargs = {
+        "patch_size": 5,
+        "embed_size": 8,
+        "token_size": 32,
+        "channel_dim": 16,
+        "num_layers": 2,
+        "dropout": DROPOUT,
+    }
+    image_size = (3, 10, 10)
+
+    output_shape = [1, 8]
+    input_image = generate_images(image_size, 1)
+
+    encoder = create_encoder(
+        MLPMixerEncoder, num_channels=image_size[0], height=image_size[1], width=image_size[2], **encoder_kwargs
+    )
+    encoder_test(
+        encoder=encoder, input_data=input_image, output_dtype=torch.float32, output_shape=output_shape, output_data=None
+    )
+
+    output_shape = [5, 8]
+    input_images = generate_images(image_size, 5)
+
+    encoder_test(
+        encoder=encoder,
+        input_data=input_images,
+        output_dtype=torch.float32,
+        output_shape=output_shape,
+        output_data=None,
+    )
+
+    assert encoder is not None
+    assert encoder.mlp_mixer.__class__.__name__ == "MLPMixer"
+    assert len(encoder.mlp_mixer.mixer_blocks) == 2
+    assert list(encoder.mlp_mixer.mixer_blocks[0].mlp1.output_shape) == [4]
+    assert encoder.mlp_mixer.patch_conv.__class__.__name__ == "Conv2d"
+    assert encoder.mlp_mixer.patch_conv.kernel_size == (5, 5)
+
+    # test for parameter updates
+    # generate tensors for parameter update test
+    target = torch.rand(output_shape)
+    image_tensor = torch.rand(input_image.shape)
+
+    # check for parameter updates
+    fpc, tpc, upc, not_updated = check_module_parameters_updated(encoder, (image_tensor,), target)
+    assert upc == tpc, (
+        f"Not all trainable parameters updated.  Parameters not updated: {not_updated}."
+        f"  Module structure\n{encoder}"
     )
 
 
@@ -202,48 +217,69 @@ def test_sequence_encoder_embed():
     embedding_size = 5
     max_len = 6
 
+    # make repeatable
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+
     # Generate data
     text, vocab = generate_random_sentences(
         num_sentences=num_sentences,
         max_len=max_len,
     )
 
-    encoder_args = {'embedding_size': embedding_size, 'vocab': vocab}
+    encoder_kwargs = {"embedding_size": embedding_size, "vocab": vocab}
 
     # Different values for reduce_output and the corresponding expected size
-    reduce_outputs = ['sum', None, 'concat']
+    reduce_outputs = ["sum", None, "concat"]
     output_shapes = [
         [num_sentences, embedding_size],
         [num_sentences, max_len, embedding_size],
-        [num_sentences, max_len * embedding_size]
+        [num_sentences, max_len * embedding_size],
     ]
 
     for reduce_output, output_shape in zip(reduce_outputs, output_shapes):
         for trainable in [True, False]:
-            encoder_args['reduce_output'] = reduce_output
-            encoder_args['embeddings_trainable'] = trainable
-            encoder_args['weights_regularizer'] = L1_REGULARIZER
-            encoder_args['dropout'] = DROPOUT
-            encoder = create_encoder(SequenceEmbedEncoder, encoder_args)
+            encoder_kwargs["reduce_output"] = reduce_output
+            encoder_kwargs["embeddings_trainable"] = trainable
+            encoder_kwargs["dropout"] = DROPOUT
+            encoder = create_encoder(SequenceEmbedEncoder, max_sequence_length=max_len, **encoder_kwargs)
 
             encoder_test(
                 encoder=encoder,
                 input_data=text,
-                output_dtype=np.float,
+                output_dtype=torch.float32,
                 output_shape=output_shape,
-                output_data=None
+                output_data=None,
             )
 
-            embed = encoder.embed_sequence.embeddings
-            assert embed.trainable == trainable
             assert encoder.embed_sequence.dropout is not None
 
+            # test for parameter updates
+            # generate tensors for parameter update test
+            target = torch.rand(output_shape)
 
-def test_sequence_encoders():
+            # check for parameter updates
+            fpc, tpc, upc, not_updated = check_module_parameters_updated(
+                encoder, (torch.tensor(text, dtype=torch.int32),), target
+            )
+            assert upc == tpc, (
+                f"Not all trainable parameters updated.  Parameters not updated: {not_updated}."
+                f"  Module structure\n{encoder}"
+            )
+
+
+@pytest.mark.parametrize("encoder_type", [ParallelCNN, StackedCNN, StackedParallelCNN, StackedRNN, StackedCNNRNN])
+@pytest.mark.parametrize("trainable", [True, False])
+@pytest.mark.parametrize("reduce_output", ["sum", "max"])
+def test_sequence_encoders(encoder_type: Encoder, trainable: bool, reduce_output: str):
     num_sentences = 4
     embedding_size = 5
     max_len = 7
-    fc_size = 3
+    output_size = 3
+
+    # make repeatable
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
 
     # Generate data
     text, vocab = generate_random_sentences(
@@ -251,49 +287,49 @@ def test_sequence_encoders():
         max_len=max_len,
     )
 
-    encoder_args = {
-        'embedding_size': embedding_size,
-        'vocab': vocab,
-        'fc_size': fc_size,
-        'num_fc_layers': 1,
-        'filter_size': 3,
-        'num_filters': 8,
-        'state_size': fc_size
+    encoder_kwargs = {
+        "embedding_size": embedding_size,
+        "vocab": vocab,
+        "output_size": output_size,
+        "num_fc_layers": 1,
+        "filter_size": 3,
+        "num_filters": 8,
+        "state_size": output_size,
     }
 
-    # Different values for reduce_output and the corresponding expected size
     # todo figure out the output size for parallel 1d conv
-    reduce_outputs = ['sum', 'max']
-    output_shapes = [
-        [num_sentences, fc_size],
-        [num_sentences, fc_size],
-        [num_sentences, max_len, fc_size]
-    ]
+    output_shape = [num_sentences, output_size]
 
-    for reduce_output, output_shape in zip(reduce_outputs, output_shapes):
-        for trainable in [True, False]:
-            for encoder_type in [ParallelCNN,
-                                 StackedCNN,
-                                 StackedParallelCNN,
-                                 StackedRNN,
-                                 StackedCNNRNN]:
-                encoder_args['reduce_output'] = reduce_output
-                encoder_args['embeddings_trainable'] = trainable
-                encoder_args['weights_regularizer'] = L1_REGULARIZER
-                encoder_args['bias_regularizer'] = L1_REGULARIZER
-                encoder_args['activity_regularizer'] = L1_REGULARIZER
-                encoder_args['dropout'] = DROPOUT
-                encoder_args['dropout'] = DROPOUT
-                encoder_args['recurrent_dropout'] = DROPOUT
-                encoder_args['fc_dropout'] = DROPOUT
-                encoder = create_encoder(encoder_type, encoder_args)
+    encoder_kwargs["embeddings_trainable"] = trainable
+    encoder_kwargs["dropout"] = DROPOUT
+    encoder_kwargs["recurrent_dropout"] = DROPOUT
+    encoder_kwargs["fc_dropout"] = DROPOUT
+    encoder_kwargs["reduce_output"] = reduce_output
+    encoder = create_encoder(encoder_type, max_sequence_length=max_len, **encoder_kwargs)
 
-                encoder_test(
-                    encoder=encoder,
-                    input_data=text,
-                    output_dtype=np.float,
-                    output_shape=output_shape,
-                    output_data=None
-                )
+    encoder_test(
+        encoder=encoder, input_data=text, output_dtype=torch.float32, output_shape=output_shape, output_data=None
+    )
 
-                assert isinstance(encoder, encoder_type)
+    assert isinstance(encoder, encoder_type)
+
+    # test for parameter updates
+    # generate tensors for parameter update test
+    target = torch.rand(output_shape)
+
+    # check for parameter updates
+    fpc, tpc, upc, not_updated = check_module_parameters_updated(
+        encoder, (torch.tensor(text, dtype=torch.int32),), target
+    )
+
+    if trainable:
+        assert fpc == 0, "Embedding layer expected to be trainable but found to be frozen"
+    else:
+        assert fpc == 1, "Embedding layer expected to be frozen, but found to be trainable."
+
+    # for given random seed and configuration and non-zero dropout updated parameter counts
+    # could take on different values
+    assert (upc == tpc) or (upc == 0), (
+        f"Not all trainable parameters updated.  Parameters not updated: {not_updated}."
+        f"  Module structure\n{encoder}"
+    )

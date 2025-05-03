@@ -1,6 +1,5 @@
 #! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,493 +13,497 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import os
+import logging
+from functools import partial
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
+from torch import Tensor
+from transformers import PreTrainedTokenizer
 
-from ludwig.constants import *
-from ludwig.encoders.text_encoders import *
-from ludwig.features.sequence_feature import SequenceInputFeature
-from ludwig.features.sequence_feature import SequenceOutputFeature
-from ludwig.utils.horovod_utils import is_on_master
+from ludwig.constants import (
+    COLUMN,
+    IGNORE_INDEX_TOKEN_ID,
+    LAST_PREDICTIONS,
+    LENGTHS,
+    NAME,
+    PREDICTIONS,
+    PREPROCESSING,
+    PROBABILITIES,
+    PROBABILITY,
+    PROC_COLUMN,
+    RESPONSE,
+    TEXT,
+)
+from ludwig.features.base_feature import BaseFeatureMixin, OutputFeature
+from ludwig.features.feature_utils import compute_sequence_probability, compute_token_probabilities
+from ludwig.features.sequence_feature import (
+    _SequencePostprocessing,
+    _SequencePreprocessing,
+    SequenceInputFeature,
+    SequenceOutputFeature,
+)
+from ludwig.modules.metric_registry import get_metric_tensor_input
+from ludwig.schema.features.text_feature import TextInputFeatureConfig, TextOutputFeatureConfig
+from ludwig.types import FeatureMetadataDict, ModelConfigDict, PreprocessingConfigDict, TrainingSetMetadataDict
 from ludwig.utils.math_utils import softmax
-from ludwig.utils.metrics_utils import ConfusionMatrix
-from ludwig.utils.misc_utils import get_from_registry
-from ludwig.utils.misc_utils import set_default_value
-from ludwig.utils.misc_utils import set_default_values
-from ludwig.utils.strings_utils import PADDING_SYMBOL
-from ludwig.utils.strings_utils import UNKNOWN_SYMBOL
-from ludwig.utils.strings_utils import build_sequence_matrix
-from ludwig.utils.strings_utils import create_vocabulary
+from ludwig.utils.strings_utils import (
+    build_sequence_matrix,
+    create_vocabulary,
+    get_tokenizer,
+    SpecialSymbol,
+    UNKNOWN_SYMBOL,
+    Vocabulary,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class TextFeatureMixin(object):
-    type = TEXT
+def get_decoded_targets_and_predictions(
+    targets: Tensor,
+    predictions: Dict[str, Tensor],
+    tokenizer: PreTrainedTokenizer,
+) -> Tuple[List[str], List[str]]:
+    """Returns the decoded targets and predictions, accounting for IGNORE_INDEX_TOKEN_ID."""
+    sanitized_targets = torch.where(targets != IGNORE_INDEX_TOKEN_ID, targets, tokenizer.pad_token_id)
+    sanitized_predictions = torch.where(
+        targets != IGNORE_INDEX_TOKEN_ID,
+        predictions[PREDICTIONS],
+        tokenizer.pad_token_id,
+    )
+    decoded_targets = tokenizer.batch_decode(sanitized_targets, skip_special_tokens=True)
+    decoded_predictions = tokenizer.batch_decode(sanitized_predictions, skip_special_tokens=True)
+    return decoded_targets, decoded_predictions
 
-    preprocessing_defaults = {
-        'char_tokenizer': 'characters',
-        'char_vocab_file': None,
-        'char_sequence_length_limit': 1024,
-        'char_most_common': 70,
-        'word_tokenizer': 'space_punct',
-        'pretrained_model_name_or_path': None,
-        'word_vocab_file': None,
-        'word_sequence_length_limit': 256,
-        'word_most_common': 20000,
-        'padding_symbol': PADDING_SYMBOL,
-        'unknown_symbol': UNKNOWN_SYMBOL,
-        'padding': 'right',
-        'lowercase': True,
-        'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': UNKNOWN_SYMBOL
-    }
 
-    @staticmethod
-    def feature_meta(column, preprocessing_parameters):
-        (
-            char_idx2str,
-            char_str2idx,
-            char_str2freq,
-            char_max_len,
-            char_pad_idx,
-            char_pad_symbol,
-            char_unk_symbol,
-        ) = create_vocabulary(
-            column,
-            tokenizer_type='characters',
-            num_most_frequent=preprocessing_parameters['char_most_common'],
-            lowercase=preprocessing_parameters['lowercase'],
-            unknown_symbol=preprocessing_parameters['unknown_symbol'],
-            padding_symbol=preprocessing_parameters['padding_symbol'],
-            pretrained_model_name_or_path=preprocessing_parameters[
-                'pretrained_model_name_or_path']
-        )
-        (
-            word_idx2str,
-            word_str2idx,
-            word_str2freq,
-            word_max_len,
-            word_pad_idx,
-            word_pad_symbol,
-            word_unk_symbol,
-        ) = create_vocabulary(
-            column,
-            tokenizer_type=preprocessing_parameters['word_tokenizer'],
-            num_most_frequent=preprocessing_parameters['word_most_common'],
-            lowercase=preprocessing_parameters['lowercase'],
-            vocab_file=preprocessing_parameters['word_vocab_file'],
-            unknown_symbol=preprocessing_parameters['unknown_symbol'],
-            padding_symbol=preprocessing_parameters['padding_symbol'],
-            pretrained_model_name_or_path=preprocessing_parameters[
-                'pretrained_model_name_or_path']
-        )
+def _get_metadata_reconciled_max_sequence_length(
+    preprocessing_parameters: Dict, vocabulary: Vocabulary
+) -> Tuple[int, int]:
+    """Reconciles the different ways sequence length can be specified in preprocessing parameters.
+
+    If the max sequence length is explicitly specified, we use the minimum of the true maximum sequence length and
+    the explicitly specified value. If the explicitly specified value is less than the true maximum sequence length, we
+    log a warning.
+
+    If the max sequence length is not specified, we use the true maximum sequence length.
+
+    Returns:
+        Tuple(max_sequence_length, sequence_length_99ptile).
+    """
+    # For sequence features with a fixed length specified by `sequence_length`, use this as the max_sequence_length.
+    if preprocessing_parameters["sequence_length"] is not None:
+        return preprocessing_parameters["sequence_length"], preprocessing_parameters["sequence_length"]
+
+    # Max sequence length is explicitly set. Use this as the max_sequence_length.
+    if preprocessing_parameters["max_sequence_length"] is not None:
+        if preprocessing_parameters["max_sequence_length"] < vocabulary.max_sequence_length:
+            logger.warning(
+                f"The max sequence length of the data, {vocabulary.max_sequence_length}, is longer than the max "
+                f"sequence length set in the config, {preprocessing_parameters['max_sequence_length']}. Note that this "
+                "will truncate all examples to max_sequence_length="
+                f"{preprocessing_parameters['max_sequence_length']}."
+            )
         return (
-            char_idx2str,
-            char_str2idx,
-            char_str2freq,
-            char_max_len,
-            char_pad_idx,
-            char_pad_symbol,
-            char_unk_symbol,
-            word_idx2str,
-            word_str2idx,
-            word_str2freq,
-            word_max_len,
-            word_pad_idx,
-            word_pad_symbol,
-            word_unk_symbol,
+            min(vocabulary.max_sequence_length, preprocessing_parameters["max_sequence_length"]),
+            min(vocabulary.sequence_length_99ptile, preprocessing_parameters["max_sequence_length"]),
         )
 
+    # Max sequence length is None. Use the max sequence length of the data.
+    return vocabulary.max_sequence_length, vocabulary.sequence_length_99ptile
+
+
+class TextFeatureMixin(BaseFeatureMixin):
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
-        tf_meta = TextFeatureMixin.feature_meta(
-            column, preprocessing_parameters
+    def type():
+        return TEXT
+
+    @staticmethod
+    def cast_column(column, backend):
+        return column.astype(str)
+
+    @staticmethod
+    def get_feature_meta(
+        config: ModelConfigDict,
+        column,
+        preprocessing_parameters: PreprocessingConfigDict,
+        backend,
+        is_input_feature: bool,
+    ) -> FeatureMetadataDict:
+        """Returns all metadata for the given text feature.
+
+        Raises:
+            ValueError, if the tokenized prompt template is longer than the max sequence length.
+        """
+        prompt_template = config.get("prompt", {}).get("template", "")
+        vocabulary: Vocabulary = create_vocabulary(
+            column,
+            tokenizer_type=preprocessing_parameters["tokenizer"],
+            num_most_frequent=preprocessing_parameters["most_common"],
+            lowercase=preprocessing_parameters["lowercase"],
+            vocab_file=preprocessing_parameters["vocab_file"],
+            unknown_symbol=preprocessing_parameters["unknown_symbol"],
+            padding_symbol=preprocessing_parameters["padding_symbol"],
+            pretrained_model_name_or_path=preprocessing_parameters["pretrained_model_name_or_path"],
+            ngram_size=preprocessing_parameters["ngram_size"],
+            compute_idf=preprocessing_parameters["compute_idf"],
+            processor=backend.df_engine,
+            prompt_template=prompt_template,
         )
-        (
-            char_idx2str,
-            char_str2idx,
-            char_str2freq,
-            char_max_len,
-            char_pad_idx,
-            char_pad_symbol,
-            char_unk_symbol,
-            word_idx2str,
-            word_str2idx,
-            word_str2freq,
-            word_max_len,
-            word_pad_idx,
-            word_pad_symbol,
-            word_unk_symbol,
-        ) = tf_meta
-        char_max_len = min(
-            preprocessing_parameters['char_sequence_length_limit'],
-            char_max_len
+        # Note: The vocabulary's max_sequence_length includes the prompt template, which is merged into the column prior
+        # to computing feature metadata.
+        logger.info(
+            f"Max length of feature '{column.name}': {vocabulary.max_sequence_length} (without start and stop symbols)"
         )
-        word_max_len = min(
-            preprocessing_parameters['word_sequence_length_limit'],
-            word_max_len
+
+        max_sequence_length, max_sequence_length_99ptile = _get_metadata_reconciled_max_sequence_length(
+            preprocessing_parameters, vocabulary
         )
+
+        if is_input_feature and max_sequence_length < vocabulary.prompt_template_num_tokens:
+            raise ValueError(
+                f"The input feature's max sequence length ({max_sequence_length}) is shorter than the prompt template "
+                f"length ({vocabulary.prompt_template_num_tokens}). This will truncate all unique information. "
+                "Consider making the template shorter or increasing the input feature's max sequence length to a "
+                f"value >> {vocabulary.prompt_template_num_tokens}."
+            )
+
+        logger.info(f"Max sequence length is {max_sequence_length} for feature '{column.name}'")
+
         return {
-            'char_idx2str': char_idx2str,
-            'char_str2idx': char_str2idx,
-            'char_str2freq': char_str2freq,
-            'char_vocab_size': len(char_idx2str),
-            'char_max_sequence_length': char_max_len,
-            'char_pad_idx': char_pad_idx,
-            'char_pad_symbol': char_pad_symbol,
-            'char_unk_symbol': char_unk_symbol,
-            'word_idx2str': word_idx2str,
-            'word_str2idx': word_str2idx,
-            'word_str2freq': word_str2freq,
-            'word_vocab_size': len(word_idx2str),
-            'word_max_sequence_length': word_max_len,
-            'word_pad_idx': word_pad_idx,
-            'word_pad_symbol': word_pad_symbol,
-            'word_unk_symbol': word_unk_symbol,
+            "idx2str": vocabulary.vocab,
+            "str2idx": vocabulary.str2idx,
+            "str2freq": vocabulary.str2freq,
+            "str2idf": vocabulary.str2idf,
+            "vocab_size": len(vocabulary.vocab),
+            "max_sequence_length": max_sequence_length,
+            "max_sequence_length_99ptile": max_sequence_length_99ptile,
+            "pad_idx": vocabulary.pad_idx,
+            "padding_symbol": vocabulary.padding_symbol,
+            "unknown_symbol": vocabulary.unknown_symbol,
+            "prompt_template_num_tokens": vocabulary.prompt_template_num_tokens,
         }
 
     @staticmethod
-    def feature_data(column, metadata, preprocessing_parameters):
-        char_data = build_sequence_matrix(
-            sequences=column,
-            inverse_vocabulary=metadata['char_str2idx'],
-            tokenizer_type=preprocessing_parameters['char_tokenizer'],
-            length_limit=metadata['char_max_sequence_length'],
-            padding_symbol=metadata['char_pad_symbol'],
-            padding=preprocessing_parameters['padding'],
-            unknown_symbol=metadata['char_unk_symbol'],
-            lowercase=preprocessing_parameters['lowercase'],
-            tokenizer_vocab_file=preprocessing_parameters[
-                'char_vocab_file'
-            ],
-            pretrained_model_name_or_path=preprocessing_parameters[
-                'pretrained_model_name_or_path'
-            ]
+    def feature_data(column, metadata, preprocessing_parameters: PreprocessingConfigDict, backend) -> np.ndarray:
+        # TODO(1891): Remove backward compatibility hack once all models have been retrained with Ludwig after
+        # https://github.com/ludwig-ai/ludwig/pull/1859.
+        prefix = ""
+        padding_symbol_metadata_key = "padding_symbol"
+        unknown_symbol_metadata_key = "unknown_symbol"
+        if "str2idx" not in metadata:
+            prefix = "word_"
+            padding_symbol_metadata_key = "word_pad_symbol"
+            unknown_symbol_metadata_key = "word_unk_symbol"
 
-        )
-        word_data = build_sequence_matrix(
-            sequences=column,
-            inverse_vocabulary=metadata['word_str2idx'],
-            tokenizer_type=preprocessing_parameters['word_tokenizer'],
-            length_limit=metadata['word_max_sequence_length'],
-            padding_symbol=metadata['word_pad_symbol'],
-            padding=preprocessing_parameters['padding'],
-            unknown_symbol=metadata['word_unk_symbol'],
-            lowercase=preprocessing_parameters['lowercase'],
-            tokenizer_vocab_file=preprocessing_parameters[
-                'word_vocab_file'
-            ],
-            pretrained_model_name_or_path=preprocessing_parameters[
-                'pretrained_model_name_or_path'
-            ]
-        )
+        # ensure preprocessing param values match the metadata determined from dataset
+        preprocessing_parameters["padding_symbol"] = metadata[padding_symbol_metadata_key]
+        preprocessing_parameters["unknown_symbol"] = metadata[unknown_symbol_metadata_key]
+        if preprocessing_parameters["fill_value"] == UNKNOWN_SYMBOL:
+            preprocessing_parameters["fill_value"] = preprocessing_parameters["unknown_symbol"]
+        if (
+            "computed_fill_value" in preprocessing_parameters
+            and preprocessing_parameters["computed_fill_value"] == UNKNOWN_SYMBOL
+        ):
+            preprocessing_parameters["computed_fill_value"] = preprocessing_parameters["unknown_symbol"]
 
-        return char_data, word_data
+        sequences = column
+
+        return build_sequence_matrix(
+            sequences=sequences,
+            inverse_vocabulary=metadata[f"{prefix}str2idx"],
+            tokenizer_type=preprocessing_parameters[f"{prefix}tokenizer"],
+            length_limit=metadata[f"{prefix}max_sequence_length"],
+            padding_symbol=metadata[padding_symbol_metadata_key],
+            padding=preprocessing_parameters["padding"],
+            unknown_symbol=metadata[unknown_symbol_metadata_key],
+            lowercase=preprocessing_parameters["lowercase"],
+            tokenizer_vocab_file=preprocessing_parameters[f"{prefix}vocab_file"],
+            pretrained_model_name_or_path=preprocessing_parameters["pretrained_model_name_or_path"],
+            processor=backend.df_engine,
+        )
 
     @staticmethod
     def add_feature_data(
-            feature,
-            dataset_df,
-            dataset,
-            metadata,
-            preprocessing_parameters
+        feature_config,
+        input_df,
+        proc_df,
+        metadata,
+        preprocessing_parameters: PreprocessingConfigDict,
+        backend,
+        skip_save_processed_input,
     ):
-        chars_data, words_data = TextFeatureMixin.feature_data(
-            dataset_df[feature[NAME]].astype(str),
-            metadata[feature[NAME]], preprocessing_parameters
+        proc_df[feature_config[PROC_COLUMN]] = TextFeatureMixin.feature_data(
+            input_df[feature_config[COLUMN]],
+            metadata[feature_config[NAME]],
+            preprocessing_parameters,
+            backend,
         )
-        dataset['{}_char'.format(feature[NAME])] = chars_data
-        dataset['{}_word'.format(feature[NAME])] = words_data
+        return proc_df
 
 
 class TextInputFeature(TextFeatureMixin, SequenceInputFeature):
-    encoder = 'parallel_cnn'
-    max_sequence_length = None
-    level = 'word'
+    def __init__(self, input_feature_config: TextInputFeatureConfig, encoder_obj=None, **kwargs):
+        super().__init__(input_feature_config, encoder_obj=encoder_obj, **kwargs)
 
-    def __init__(self, feature, encoder_obj=None):
-        super().__init__(feature, encoder_obj=encoder_obj)
-        if 'pad_idx' in feature.keys():
-            self.pad_idx = feature['pad_idx']
-        else:
-            self.pad_idx = None
-
-    def call(self, inputs, training=None, mask=None):
-        assert isinstance(inputs, tf.Tensor)
-        assert inputs.dtype == tf.int8 or inputs.dtype == tf.int16 or \
-               inputs.dtype == tf.int32 or inputs.dtype == tf.int64
+    def forward(self, inputs, mask=None):
+        assert isinstance(inputs, torch.Tensor)
+        assert (
+            inputs.dtype == torch.int8
+            or inputs.dtype == torch.int16
+            or inputs.dtype == torch.int32
+            or inputs.dtype == torch.int64
+        )
         assert len(inputs.shape) == 2
 
-        inputs_exp = tf.cast(inputs, dtype=tf.int32)
+        inputs_mask = torch.not_equal(inputs, SpecialSymbol.PADDING.value)
 
-        if self.pad_idx is not None:
-            inputs_mask = tf.not_equal(inputs, self.pad_idx)
-        else:
-            inputs_mask = None
-
-        encoder_output = self.encoder_obj(
-            inputs_exp, training=training, mask=inputs_mask
-        )
+        inputs_exp = inputs.type(torch.int32)
+        lengths = torch.sum(inputs_mask.type(torch.int32), dim=1)
+        encoder_output = self.encoder_obj(inputs_exp, mask=inputs_mask)
+        encoder_output[LENGTHS] = lengths
 
         return encoder_output
 
-    def get_input_dtype(self):
-        return tf.int32
+    @property
+    def input_dtype(self):
+        return torch.int32
 
-    def get_input_shape(self):
-        return None,
+    @property
+    def input_shape(self):
+        return torch.Size([self.encoder_obj.config.max_sequence_length])
 
-    @staticmethod
-    def update_config_with_metadata(
-            input_feature,
-            feature_metadata,
-            *args,
-            **kwargs
-    ):
-        input_feature['vocab'] = (
-            feature_metadata[input_feature['level'] + '_idx2str']
-        )
-        input_feature['max_sequence_length'] = (
-            feature_metadata[input_feature['level'] + '_max_sequence_length']
-        )
-        input_feature['pad_idx'] = (
-            feature_metadata[input_feature['level'] + '_pad_idx']
-        )
-        input_feature['num_tokens'] = (
-            len(feature_metadata[input_feature['level'] + '_idx2str'])
-        )
+    def update_config_after_module_init(self, feature_config):
+        feature_config.encoder = self.encoder_obj.config
 
     @staticmethod
-    def populate_defaults(input_feature):
-        set_default_values(
-            input_feature,
-            {
-                TIED: None,
-                'encoder': 'parallel_cnn',
-                'level': 'word'
-            }
-        )
+    def update_config_with_metadata(feature_config, feature_metadata, *args, **kwargs):
+        feature_config.encoder.vocab = feature_metadata["idx2str"]
+        feature_config.encoder.vocab_size = len(feature_metadata["idx2str"])
+        feature_config.encoder.max_sequence_length = feature_metadata["max_sequence_length"]
+        feature_config.encoder.pad_idx = feature_metadata["pad_idx"]
+        feature_config.encoder.num_tokens = len(feature_metadata["idx2str"])
+        feature_config.encoder.str2freq = feature_metadata["str2freq"]
+        feature_config.encoder.str2idf = feature_metadata["str2idf"]
+        feature_config.encoder.skip = feature_metadata[PREPROCESSING].get("cache_encoder_embeddings", False)
 
-        encoder_class = get_from_registry(
-            input_feature['encoder'],
-            TextInputFeature.encoder_registry
-        )
+    @staticmethod
+    def get_schema_cls():
+        return TextInputFeatureConfig
 
-        if hasattr(encoder_class, 'default_params'):
-            set_default_values(
-                input_feature,
-                encoder_class.default_params
-            )
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.encoder_obj.output_shape
 
-    encoder_registry = {
-        'bert': BERTEncoder,
-        'gpt': GPTEncoder,
-        'gpt2': GPT2Encoder,
-        # 'transformer_xl': TransformerXLEncoder,
-        'xlnet': XLNetEncoder,
-        'xlm': XLMEncoder,
-        'roberta': RoBERTaEncoder,
-        'distilbert': DistilBERTEncoder,
-        'ctrl': CTRLEncoder,
-        'camembert': CamemBERTEncoder,
-        'albert': ALBERTEncoder,
-        't5': T5Encoder,
-        'xlmroberta': XLMRoBERTaEncoder,
-        'flaubert': FlauBERTEncoder,
-        'electra': ELECTRAEncoder,
-        'longformer': LongformerEncoder,
-        'auto_transformer': AutoTransformerEncoder,
-        **SequenceInputFeature.encoder_registry
-    }
+    @staticmethod
+    def create_preproc_module(metadata: TrainingSetMetadataDict) -> torch.nn.Module:
+        return _SequencePreprocessing(metadata)
 
 
 class TextOutputFeature(TextFeatureMixin, SequenceOutputFeature):
-    loss = {TYPE: SOFTMAX_CROSS_ENTROPY}
-    metric_functions = {LOSS: None, TOKEN_ACCURACY: None, LAST_ACCURACY: None,
-                        PERPLEXITY: None, EDIT_DISTANCE: None}
-    default_validation_metric = LOSS
-    max_sequence_length = 0
-    num_classes = 0
-    level = 'word'
+    def __init__(
+        self,
+        output_feature_config: Union[TextOutputFeatureConfig, Dict],
+        output_features: Dict[str, OutputFeature],
+        **kwargs,
+    ):
+        super().__init__(output_feature_config, output_features, **kwargs)
 
-    def __init__(self, feature):
-        super().__init__(feature)
+    @classmethod
+    def get_output_dtype(cls):
+        return torch.int32
 
-    def get_output_dtype(self):
-        return tf.int32
+    @property
+    def output_shape(self) -> torch.Size:
+        return torch.Size([self.decoder_obj.config.max_sequence_length])
 
-    def get_output_shape(self):
-        return self.max_sequence_length,
+    def update_metrics(
+        self,
+        targets: Tensor,
+        predictions: Dict[str, Tensor],
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+    ) -> None:
+        """Updates metrics with the given targets and predictions.
 
-    def overall_statistics_metadata(self):
-        return {'level': self.level}
+        If decoded_targets and decoded_predictions are provided, as through LLM model types, then additional
+        response-based metrics like BLEU and ROUGE are also computed.
+
+        Args:
+            targets: Tensor with target values for this output feature.
+            predictions: Dict of tensors returned by predictions().
+        """
+        if tokenizer is not None:
+            # Decode the targets and predictions to compute response-based metrics using the initialized tokenizer.
+            decoded_targets, decoded_predictions = get_decoded_targets_and_predictions(targets, predictions, tokenizer)
+
+        for metric_name, metric_fn in self._metric_functions.items():
+            prediction_key = get_metric_tensor_input(metric_name)
+            try:
+                if prediction_key == RESPONSE:
+                    if tokenizer is not None:
+                        # RESPONSE metrics cannot be computed if decoded texts are not provided.
+                        # Decoded texts are only provided using the LLM model type.
+                        if decoded_targets is not None and decoded_predictions is not None:
+                            # Move metric function to the device of the predictions.
+                            # For CUDA, it can be computed on any of the GPUs since it uses allgather to collect
+                            # the results from all GPUs and compute the final metric.
+                            # We use 'predictions' as the key since it is always present in the predictions dict.
+                            device = "cuda" if predictions["predictions"].is_cuda else "cpu"
+                            metric_fn = metric_fn.to(device)
+                            if metric_name == "bleu":
+                                # BLEU takes in targets as a list.
+                                metric_fn.update(decoded_predictions, [decoded_targets])
+                            else:
+                                metric_fn.update(decoded_predictions, decoded_targets)
+                else:
+                    metric_fn = metric_fn.to(predictions[prediction_key].device)
+                    metric_fn.update(predictions[prediction_key].detach(), targets)
+            except Exception as e:
+                logger.info(f"Ran into error when calculating metric {metric_name}. Skipping. The error is: {e}")
 
     @staticmethod
-    def update_config_with_metadata(
-            output_feature,
-            feature_metadata,
-            *args,
-            **kwargs
-    ):
-        output_feature['num_classes'] = feature_metadata[
-            '{}_vocab_size'.format(output_feature['level'])
-        ]
-        output_feature['max_sequence_length'] = feature_metadata[
-            '{}_max_sequence_length'.format(output_feature['level'])
-        ]
-        if isinstance(output_feature[LOSS]['class_weights'], (list, tuple)):
+    def update_config_with_metadata(feature_config, feature_metadata, *args, **kwargs):
+        feature_config.decoder.vocab_size = feature_metadata["vocab_size"]
+        feature_config.decoder.max_sequence_length = feature_metadata["max_sequence_length"]
+        if isinstance(feature_config.loss.class_weights, (list, tuple)):
             # [0, 0] for UNK and PAD
-            output_feature[LOSS]['class_weights'] = (
-                    [0, 0] + output_feature[LOSS]['class_weights']
-            )
-            if (len(output_feature[LOSS]['class_weights']) !=
-                    output_feature['num_classes']):
+            feature_config.loss.class_weights = [0, 0] + feature_config.loss.class_weights
+            if len(feature_config.loss.class_weights) != feature_config.decoder.vocab_size:
                 raise ValueError(
-                    'The length of class_weights ({}) is not compatible with '
-                    'the number of classes ({})'.format(
-                        len(output_feature[LOSS]['class_weights']),
-                        output_feature['num_classes']
-                    )
+                    f"The length of class_weights ({len(feature_config.loss.class_weights)}) is not compatible with "
+                    f"the number of classes ({feature_config.decoder.vocab_size})"
                 )
 
-        if output_feature[LOSS]['class_similarities_temperature'] > 0:
-            if 'class_similarities' in output_feature:
-                distances = output_feature['class_similarities']
-                temperature = output_feature[LOSS][
-                    'class_similarities_temperature']
+        if isinstance(feature_config.loss.class_weights, dict):
+            if feature_metadata["str2idx"].keys() != feature_config.loss.class_weights.keys():
+                raise ValueError(
+                    f"The class_weights keys ({feature_config.loss.class_weights.keys()}) are not compatible with "
+                    f'the classes ({feature_metadata["str2idx"].keys()}) of feature {feature_config.column}. '
+                    "Check the metadata JSON file to see the classes "
+                    "and consider there needs to be a weight "
+                    "for the <UNK> class too."
+                )
+            else:
+                class_weights = feature_config.loss.class_weights
+                idx2str = feature_metadata["idx2str"]
+                class_weights_list = [class_weights[s] for s in idx2str]
+                feature_config.loss.class_weights = class_weights_list
+
+        if feature_config.loss.class_similarities_temperature > 0:
+            if feature_config.class_similarities:
+                distances = feature_config.class_similarities
+                temperature = feature_config.loss.class_similarities_temperature
                 for i in range(len(distances)):
-                    distances[i, :] = softmax(
-                        distances[i, :],
-                        temperature=temperature
-                    )
-                output_feature[LOSS]['class_similarities'] = distances
+                    distances[i, :] = softmax(distances[i, :], temperature=temperature)
+                feature_config.loss.class_similarities = distances
             else:
                 raise ValueError(
-                    'class_similarities_temperature > 0,'
-                    'but no class similarities are provided '
-                    'for feature {}'.format(output_feature[NAME])
+                    "class_similarities_temperature > 0,"
+                    "but no class similarities are provided "
+                    "for feature {}".format(feature_config.column)
                 )
-
-        if output_feature[LOSS][TYPE] == 'sampled_softmax_cross_entropy':
-            level_str2freq = '{}_str2freq'.format(output_feature['level'])
-            level_idx2str = '{}_idx2str'.format(output_feature['level'])
-            output_feature[LOSS]['class_counts'] = [
-                feature_metadata[level_str2freq][cls]
-                for cls in feature_metadata[level_idx2str]
-            ]
 
     @staticmethod
     def calculate_overall_stats(
-            predictions,
-            targets,
-            train_set_metadata,
+        predictions,
+        targets,
+        train_set_metadata,
     ):
-        overall_stats = {}
-        level_idx2str = '{}_{}'.format(train_set_metadata['level'], 'idx2str')
-
-        sequences = targets
-        last_elem_sequence = sequences[np.arange(sequences.shape[0]),
-                                       (sequences != 0).cumsum(1).argmax(1)]
-        confusion_matrix = ConfusionMatrix(
-            last_elem_sequence,
-            predictions[LAST_PREDICTIONS],
-            labels=train_set_metadata[level_idx2str]
-        )
-        overall_stats['confusion_matrix'] = confusion_matrix.cm.tolist()
-        overall_stats['overall_stats'] = confusion_matrix.stats()
-        overall_stats['per_class_stats'] = confusion_matrix.per_class_stats()
-
-        return overall_stats
+        return {}
 
     def postprocess_predictions(
-            self,
-            result,
-            metadata,
-            output_directory,
-            skip_save_unprocessed_output=False,
+        self,
+        result,
+        metadata,
     ):
         # todo: refactor to reuse SequenceOutputFeature.postprocess_predictions
-        postprocessed = {}
-        name = self.feature_name
-        level_idx2str = '{}_{}'.format(self.level, 'idx2str')
+        predictions_col = f"{self.feature_name}_{PREDICTIONS}"
 
-        npy_filename = None
-        if is_on_master():
-            npy_filename = os.path.join(output_directory, '{}_{}.npy')
-        else:
-            skip_save_unprocessed_output = True
+        tokenizer = None
+        if metadata["preprocessing"]["tokenizer"] == "hf_tokenizer":
+            tokenizer = get_tokenizer(
+                metadata["preprocessing"]["tokenizer"],
+                metadata["preprocessing"]["vocab_file"],
+                metadata["preprocessing"]["pretrained_model_name_or_path"],
+            )
 
-        if PREDICTIONS in result and len(result[PREDICTIONS]) > 0:
-            preds = result[PREDICTIONS]
-            if level_idx2str in metadata:
-                postprocessed[PREDICTIONS] = [
-                    [metadata[level_idx2str][token]
-                     if token < len(
-                        metadata[level_idx2str]) else UNKNOWN_SYMBOL
-                     for token in pred]
-                    for pred in preds
-                ]
-            else:
-                postprocessed[PREDICTIONS] = preds
+        if predictions_col in result:
+            token_col = result[predictions_col]
 
-            if not skip_save_unprocessed_output:
-                np.save(npy_filename.format(name, PREDICTIONS), preds)
+            def idx2str(pred):
+                if tokenizer is None:
+                    return [
+                        metadata["idx2str"][token] if token < len(metadata["idx2str"]) else UNKNOWN_SYMBOL
+                        for token in pred
+                    ]
+                return tokenizer.tokenizer.batch_decode(pred, skip_special_tokens=True)
 
-            del result[PREDICTIONS]
+            result[predictions_col] = token_col.map(idx2str)
 
-        if LAST_PREDICTIONS in result and len(result[LAST_PREDICTIONS]) > 0:
-            last_preds = result[LAST_PREDICTIONS]
-            if level_idx2str in metadata:
-                postprocessed[LAST_PREDICTIONS] = [
-                    metadata[level_idx2str][last_pred]
-                    if last_pred < len(
-                        metadata[level_idx2str]) else UNKNOWN_SYMBOL
-                    for last_pred in last_preds
-                ]
-            else:
-                postprocessed[LAST_PREDICTIONS] = last_preds
+            # Add additional response column that represents the predicted text output
+            # as a single string instead of a list of tokens.
+            def idx2response(pred):
+                if tokenizer is None:
+                    # This works because we treat each word as a token.
+                    return " ".join(
+                        [
+                            metadata["idx2str"][token] if token < len(metadata["idx2str"]) else UNKNOWN_SYMBOL
+                            for token in pred
+                        ]
+                    )
+                return tokenizer.tokenizer.batch_decode([pred], skip_special_tokens=True)
 
-            if not skip_save_unprocessed_output:
-                np.save(npy_filename.format(name, LAST_PREDICTIONS),
-                        last_preds)
+            result[f"{self.feature_name}_response"] = token_col.map(idx2response)
 
-            del result[LAST_PREDICTIONS]
+        last_preds_col = f"{self.feature_name}_{LAST_PREDICTIONS}"
+        if last_preds_col in result:
 
-        if PROBABILITIES in result and len(result[PROBABILITIES]) > 0:
-            probs = result[PROBABILITIES]
-            if probs is not None:
+            def last_idx2str(last_pred):
+                if last_pred < len(metadata["idx2str"]):
+                    return metadata["idx2str"][last_pred]
+                return UNKNOWN_SYMBOL
 
-                if len(probs) > 0 and isinstance(probs[0], list):
-                    prob = []
-                    for i in range(len(probs)):
-                        for j in range(len(probs[i])):
-                            probs[i][j] = np.max(probs[i][j])
-                        prob.append(np.prod(probs[i]))
-                else:
-                    probs = np.amax(probs, axis=-1)
-                    prob = np.prod(probs, axis=-1)
+            result[last_preds_col] = result[last_preds_col].map(last_idx2str)
 
-                # commenting probabilities out because usually it is huge:
-                # dataset x length x classes
-                # todo: add a mechanism for letting the user decide to save it
-                # postprocessed[PROBABILITIES] = probs
-                postprocessed[PROBABILITY] = prob
+        probs_col = f"{self.feature_name}_{PROBABILITIES}"
+        prob_col = f"{self.feature_name}_{PROBABILITY}"
 
-                if not skip_save_unprocessed_output:
-                    # commenting probabilities out, see comment above
-                    # np.save(npy_filename.format(name, PROBABILITIES), probs)
-                    np.save(npy_filename.format(name, PROBABILITY), prob)
+        # "Summarizes" the `result`'s probability-related output:
+        # - result[probs_col]:
+        #       Each row is now a list of "max" probabilities. Each element is the probability of the argmax token for
+        #       the given time step.
+        #
+        #       Note that we intentionally do not return full list of probabilties for each time step because the output
+        #       of postprocess_predictions is saved to disk and the full probability distribution can be huge,
+        #       especially for large vocab sizes:
+        #           dataset_size x sequence_length x vocab_size
+        #
+        #       TODO: Add a mechanism that lets the user save the full probability distribution if they want.
+        # - result[prob_col]:
+        #       Each row is the overall probability of the sequence. This is the product of the max probabilities over
+        #       all time steps.
+        if probs_col in result:
+            # result[probs_col]: From PredictModule, each row has a list of size (sequence_length) of a list of
+            # probabiltiies of (vocab_size). compute_token_probabilities gets the maximum probability per timestep.
+            result[probs_col] = result[probs_col].map(compute_token_probabilities)
+            result[prob_col] = result[probs_col].map(
+                partial(
+                    compute_sequence_probability,
+                    max_sequence_length=metadata["max_sequence_length"],
+                    return_log_prob=True,
+                ),
+            )
 
-            del result[PROBABILITIES]
+        lengths_col = f"{self.feature_name}_{LENGTHS}"
+        if lengths_col in result:
+            del result[lengths_col]
 
-        if LENGTHS in result:
-            del result[LENGTHS]
-
-        return postprocessed
+        return result
 
     @staticmethod
-    def populate_defaults(output_feature):
-        set_default_value(output_feature, 'level', 'word')
-        SequenceOutputFeature.populate_defaults(output_feature)
+    def create_postproc_module(metadata: TrainingSetMetadataDict) -> torch.nn.Module:
+        return _SequencePostprocessing(metadata)
+
+    @staticmethod
+    def get_schema_cls():
+        return TextOutputFeatureConfig

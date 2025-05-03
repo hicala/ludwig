@@ -1,6 +1,5 @@
 #! /usr/bin/env python
-# coding=utf-8
-# Copyright (c) 2019 Uber Technologies, Inc.
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,23 +16,44 @@
 import logging
 import re
 import unicodedata
-from abc import abstractmethod
 from collections import Counter
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
+from dateutil.parser import parse as parse_datetime
 
+from ludwig.constants import PADDING_SYMBOL, START_SYMBOL, STOP_SYMBOL, UNKNOWN_SYMBOL
+from ludwig.data.dataframe.base import DataFrameEngine
+from ludwig.data.dataframe.pandas import PANDAS
+from ludwig.utils.fs_utils import open_file
 from ludwig.utils.math_utils import int_type
-from ludwig.utils.misc_utils import get_from_registry
-from ludwig.utils.nlp_utils import load_nlp_pipeline, process_text
+from ludwig.utils.tokenizers import get_tokenizer_from_registry
+from ludwig.utils.types import Series
 
-UNKNOWN_SYMBOL = '<UNK>'
-PADDING_SYMBOL = '<PAD>'
-PADDING_IDX = 0
+PANDAS_TRUE_STRS = {"true"}
+PANDAS_FALSE_STRS = {"false"}
 
-SPLIT_REGEX = re.compile(r'\s+')
-SPACE_PUNCTUATION_REGEX = re.compile(r'\w+|[^\w\s]')
-COMMA_REGEX = re.compile(r'\s*,\s*')
-UNDERSCORE_REGEX = re.compile(r'\s*_\s*')
+BOOL_TRUE_STRS = {"yes", "y", "true", "t", "1", "1.0"}
+BOOL_FALSE_STRS = {"no", "n", "false", "f", "0", "0.0", "-1", "-1.0"}
+
+logger = logging.getLogger(__name__)
+
+
+class SpecialSymbol(Enum):
+    """Special symbols used for text features."""
+
+    STOP = 0
+    START = 1
+    PADDING = 2
+    UNKNOWN = 3
+
+
+def all_bool_strs():
+    """Returns all valid boolean strings, with varied capitalization."""
+    fns = [lambda x: x, lambda x: x.upper(), lambda x: x.capitalize()]
+    return sorted({fn(x) for fn in fns for x in BOOL_TRUE_STRS | BOOL_FALSE_STRS})
 
 
 def make_safe_filename(s):
@@ -41,18 +61,119 @@ def make_safe_filename(s):
         if c.isalnum():
             return c
         else:
-            return '_'
+            return "_"
 
-    return ''.join(safe_char(c) for c in s).rstrip('_')
+    return "".join(safe_char(c) for c in s).rstrip("_")
 
 
 def strip_accents(s):
-    return ''.join(c for c in unicodedata.normalize('NFD', s)
-                   if unicodedata.category(c) != 'Mn')
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 
-def str2bool(v):
-    return str(v).lower() in ('yes', 'true', 't', '1')
+def str2bool(v: str, fallback_true_label=None) -> bool:
+    """Returns bool representation of the given value v.
+
+    Check the value against global bool string lists.
+    Fallback to using fallback_true_label as True if the value isn't in the global bool lists.
+
+    args:
+        v: Value to get the bool representation for.
+        fallback_true_label: (str) label to use as 'True'.
+    """
+    v_str = str(v).lower()
+    if v_str in BOOL_TRUE_STRS:
+        return True
+    if v_str in BOOL_FALSE_STRS:
+        return False
+    if fallback_true_label is None:
+        raise ValueError(
+            f"Cannot automatically map value '{v}' to a boolean and no `preprocessing.fallback_true_label` specified"
+        )
+    return v == fallback_true_label
+
+
+def values_are_pandas_numbers(values: List[str]):
+    """Returns True if values would be read by pandas as dtype float or int."""
+    for v in values:
+        try:
+            float(v)
+        except ValueError:
+            return False
+    return True
+
+
+def values_are_pandas_bools(values: List[str]):
+    """Returns True if values would be read by pandas as dtype bool."""
+    lowercase_values_set = {str(v).lower() for v in values}
+    return lowercase_values_set.issubset(PANDAS_FALSE_STRS | PANDAS_TRUE_STRS)
+
+
+def are_conventional_bools(values: List[Union[str, bool]]) -> bool:
+    """Returns whether all values are conventional booleans."""
+    for value in values:
+        lower_value = str(value).lower()
+        if lower_value not in BOOL_TRUE_STRS and lower_value not in BOOL_FALSE_STRS:
+            return False
+    return True
+
+
+def is_number(s: Union[str, int, float]):
+    """Returns whether specified value is number."""
+    if isinstance(s, str) and s.lower() == "nan":
+        return True
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def is_datetime(s: Union[str, int, float]):
+    """Returns whether specified value is datetime."""
+    if is_number(s):
+        return False
+
+    try:
+        parse_datetime(s)
+        return True
+    except Exception:
+        return False
+
+
+def are_all_datetimes(values: List[Union[str, int, float]]):
+    """Returns whether all values are datetimes."""
+    for value in values:
+        if not is_datetime(value):
+            return False
+    return True
+
+
+def are_all_numbers(values: List[Union[str, int, float]]):
+    """Returns whether all values are numbers."""
+    for value in values:
+        if not is_number(value):
+            return False
+    return True
+
+
+def is_integer(s: Union[str, int, float]):
+    """Returns whether specified value is an integer."""
+    try:
+        float(s)
+    except ValueError:
+        return False
+    else:
+        return float(s).is_integer() and not np.isnan(float(s))
+
+
+def are_sequential_integers(values: List[Union[str, int, float]]):
+    """Returns whether distinct values form sequential integer list."""
+    int_list = []
+    for value in values:
+        if not is_integer(value):
+            return False
+        int_list.append(int(float(value)))
+    return (max(int_list) - min(int_list) + 1) == len(int_list)
 
 
 def match_replace(string_to_match, list_regex):
@@ -75,1204 +196,395 @@ def match_replace(string_to_match, list_regex):
 
 
 def load_vocabulary(vocab_file):
-    with open(vocab_file, 'r', encoding='utf-8') as f:
+    with open_file(vocab_file, "r", encoding="utf-8") as f:
         vocabulary = []
         for line in f:
             line = line.strip()
-            if ' ' in line:
-                line = line.split(' ')[0]
+            if " " in line:
+                line = line.split(" ")[0]
             vocabulary.append(line)
         return vocabulary
-        # return [line.strip() for line in f]
 
 
-def create_vocabulary(
-        data,
-        tokenizer_type='space',
-        add_unknown=True,
-        add_padding=True,
-        lowercase=True,
-        num_most_frequent=None,
-        vocab_file=None,
-        unknown_symbol=UNKNOWN_SYMBOL,
-        padding_symbol=PADDING_SYMBOL,
-        pretrained_model_name_or_path=None
-):
-    vocab = None
-    max_line_length = 0
-    unit_counts = Counter()
+def add_or_move_symbol(vocab_list: List[str], vocab_set: Set[str], symbol: str, index: int):
+    """Inserts or moves the symbol to the specified index."""
+    if symbol in vocab_set:
+        vocab_list.remove(symbol)
+    vocab_list.insert(index, symbol)
 
-    tokenizer = get_from_registry(
-        tokenizer_type,
-        tokenizer_registry
-    )(
-        vocab_file=vocab_file,
-        pretrained_model_name_or_path=pretrained_model_name_or_path,
-    )
 
-    if tokenizer_type == 'hf_tokenizer':
+@dataclass
+class Vocabulary:
+    vocab: List[str]
+    """List of strings representing the computed vocabulary."""
+
+    str2idx: Dict[str, int]
+    """Map of symbol to index."""
+
+    str2freq: Dict[str, int]
+    """Map of symbol to frequency."""
+
+    str2idf: Optional[Dict[str, int]]
+    """Map of symbol to inverse document frequency."""
+
+    max_sequence_length: int
+    """Maximum sequence length."""
+
+    sequence_length_99ptile: int
+    """99th percentile of maximum sequence length."""
+
+    pad_idx: int
+    """Index to padding symbol."""
+
+    padding_symbol: str
+    """Actual padding symbol."""
+
+    unknown_symbol: str
+    """Actual unknown symbol."""
+
+    prompt_template_num_tokens: int = 0
+    """The number of tokens in the prompt template.
+
+    If -1, then there is no prompt template.
+    """
+
+
+def _get_vocab_from_dict(vocab: Dict[str, int]) -> List[str]:
+    """Returns a vocab in list format from a vocab token=>idx dictionary."""
+    vocab_values = list(vocab.values())
+    if len(set(vocab_values)) != len(vocab_values):
+        raise ValueError("Vocabulary has duplicate mappings in its vocabulary. This should never happen.")
+
+    # construct a vocab that is a list that reflects the token=>index mapping in HF's vocab
+    # pre-allocate a list to make sure each index is inited to prevent OBO errors caused by missing indices
+    max_idx = max(vocab_values)
+    vocab_list = [None for _ in range(max_idx + 1)]
+    for token, idx in vocab.items():
+        vocab_list[idx] = token
+    return vocab_list
+
+
+def _get_vocabulary(
+    tokenizer_type: str,
+    tokenizer,
+    vocab_file: str,
+    unknown_symbol: str,
+    add_special_symbols: bool,
+    padding_symbol: str,
+    unit_counts: Counter,
+    num_most_frequent: int,
+) -> Optional[List[str]]:
+    """Returns the vocabulary from the tokenizer_type, tokenizer, or vocab_file.
+
+    If the `tokenizer_type` is 'hf_tokenizer', then the set vocabulary from the tokenizer is used.
+
+    If there's no vocab_file or if the tokenizer has no set vocabulary (e.g. space_punct), then the vocabulary is
+    determined from the tokenized data (unit_counts).
+
+    The UNKNOWN special symbol is always included in the final vocabulary. Additional special symbols (PADDING, START,
+    STOP) are added if add_special_symbols=True. If the tokenizer is a pre-trained huggingface tokenizer, then the
+    special symbols are taken from the tokenizer's vocabulary.
+    """
+    # Pre-trained huggingface tokenizer. Use the pre-existing vocabulary and special symbols.
+    if tokenizer_type == "hf_tokenizer":
         try:
-            vocab = tokenizer.tokenizer.get_vocab()
-            vocab = list(vocab.keys())
+            return _get_vocab_from_dict(tokenizer.get_vocab())
         except NotImplementedError:
+            logger.warning(
+                "HuggingFace tokenizer does not have a get_vocab() method. "
+                + "Using tokenizer.tokenizer.vocab_size and tokenizer.tokenizer._convert_id_to_token "
+                + "to build the vocabulary."
+            )
             vocab = []
             for idx in range(tokenizer.tokenizer.vocab_size):
                 vocab.append(tokenizer.tokenizer._convert_id_to_token(idx))
             vocab += tokenizer.tokenizer.added_tokens_encoder.keys()
+            return vocab
 
-        pad_token = tokenizer.tokenizer.pad_token
-        unk_token = tokenizer.tokenizer.unk_token
+    # The tokenizer has a preset vocabulary.
+    if hasattr(tokenizer, "get_vocab"):
+        return _get_vocab_from_dict(tokenizer.get_vocab())
 
-        if pad_token is None:
-            vocab = vocab + [padding_symbol]
-        else:
-            padding_symbol = pad_token
+    # Load the vocabulary from the vocab file.
+    if vocab_file is not None:
+        return load_vocabulary(vocab_file)
 
-        if unk_token is None:
-            vocab = vocab + [unknown_symbol]
-        else:
-            unknown_symbol = unk_token
+    # The tokenizer had no preset vocabulary, for example space_punct.
+    # Compute the vocabulary from tokenized data.
+    return [unit for unit, _ in unit_counts.most_common(num_most_frequent)]
 
-    elif vocab_file is not None:
-        vocab = load_vocabulary(vocab_file)
 
-    for line in data:
-        processed_line = tokenizer(line.lower() if lowercase else line)
-        unit_counts.update(processed_line)
-        max_line_length = max(max_line_length, len(processed_line))
+def remove_bracketed_elements(prompt_template: str) -> str:
+    """Example: <The {pronoun} sits on the {object}> -> <The  sits on the >."""
+    pattern = r"\{.*?\}"
+    return re.sub(pattern, "", prompt_template)
 
-    if vocab is None:
-        vocab = [unit for unit, count in
-                 unit_counts.most_common(num_most_frequent)]
 
-    vocab_set = set(vocab)
+def create_vocabulary(
+    data: Series,
+    tokenizer_type: str = "space",
+    lowercase: bool = True,
+    num_most_frequent: int = None,
+    vocab_file: str = None,
+    add_special_symbols: bool = True,
+    unknown_symbol: str = UNKNOWN_SYMBOL,
+    padding_symbol: str = PADDING_SYMBOL,
+    start_symbol: str = START_SYMBOL,
+    stop_symbol: str = STOP_SYMBOL,
+    pretrained_model_name_or_path: str = None,
+    ngram_size: Optional[int] = None,
+    compute_idf: bool = False,
+    processor: DataFrameEngine = PANDAS,
+    prompt_template: str = "",
+) -> Vocabulary:
+    """Computes a vocabulary over the provided data frame.
 
-    if add_unknown and tokenizer_type != 'hf_tokenizer':
-        if unknown_symbol in vocab_set:
-            vocab.remove(unknown_symbol)
-        vocab = [unknown_symbol] + vocab
-    if add_padding and tokenizer_type != 'hf_tokenizer':
-        if padding_symbol in vocab_set:
-            vocab.remove(padding_symbol)
-        vocab = [padding_symbol] + vocab
+    This function is used when the data consists of multiple tokens within one example. E.g., words in a text feature,
+    items in a set feature, etc. If the feature only contains a single token like for category features,
+    `create_vocabulary_single_token` should be used instead, as it is more efficient.
 
-    str2idx = {unit: i for i, unit in enumerate(vocab)}
-    str2freq = {unit: unit_counts.get(unit) if unit in unit_counts else 0 for
-                unit in vocab}
+    A tokenizer is specified using the `tokenizer_type`. The tokenizer will be used to process all of the data
+    provided, producing an indexed vocabulary with frequency counts. If the `tokenizer_type` is 'hf_tokenizer',
+    then a pre-trained huggingface tokenizer is loaded from `pretrained_model_name_or_path` and that vocabulary is
+    used directly.
+
+    The UNKNOWN special symbol is always included in the final vocabulary. Additional special symbols (PADDING, START,
+    STOP) are added if add_special_symbols=True. If the tokenizer is a pre-trained huggingface tokenizer, then the
+    special symbols are taken from the tokenizer's vocabulary.
+
+    Args:
+        prompt_template: The prompt template for the model. Applicable only to LLMs.
+        data: Series of string data.
+        tokenizer_type: Tokenizer type. Can be a tokenizer registry value or 'hf_tokenizer' for huggingface.
+        lowercase: Whether to lowercase all strings.
+        num_most_frequent: Upper limit on vocabulary size.,
+        add_special_symbols: If True, START, STOP, PADDING special symbols are added to the vocabulary. UNKNOWN is
+            always added.
+        unknown_symbol: String representation for the UNKNOWN symbol.
+        padding_symbol: String representation for the PADDING symbol.
+        start_symbol: String representation for the START symbol.
+        stop_symbol: String representation for the STOP symbol.
+        pretrained_model_name_or_path: Name/path to huggingface model.
+        ngram_size: Size of the n-gram when using `ngram` tokenizer.
+        compute_idf: If True, computes the inverse document frequency for each token.
+        processor: Which processor to use to process data.
+
+    Returns:
+        Vocabulary object containing metadata about the vocab.
+
+    TODO(Justin): Clean up pad_idx, padding_symbol, unknown_symbol return, as no one seems to be using it.
+    """
+    tokenizer = get_tokenizer_from_registry(tokenizer_type)(
+        vocab_file=vocab_file,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        ngram_size=ngram_size,
+    )
+
+    # Number of tokens in template.
+    prompt_template_num_tokens = -1
+    if prompt_template:
+        prompt_without_bracketed_elements = remove_bracketed_elements(prompt_template)
+        prompt_template_num_tokens = len(tokenizer(prompt_without_bracketed_elements))
+
+    # Tokenize the data.
+    def process_line(line):
+        return tokenizer(line.lower() if lowercase else line)
+
+    processed_lines = processor.map_objects(data, process_line)
+    processed_counts = processed_lines.explode().value_counts(sort=False)
+    processed_counts = processor.compute(processed_counts)
+    unit_counts = Counter(dict(processed_counts))
+    max_sequence_length = processor.compute(processed_lines.map(len).max())
+    sequence_length_99ptile = processor.compute(processed_lines.map(len).quantile(0.99))
+
+    if tokenizer_type != "hf_tokenizer":
+        # For non-HF tokenizers, add 2 for start and stop symbols.
+        max_sequence_length += 2
+        sequence_length_99ptile += 2
 
     pad_idx = None
-    if padding_symbol in str2idx.keys():
+    if tokenizer_type == "hf_tokenizer":
+        # Replace the special symbols with the ones from the tokenizer.
+        unknown_symbol = tokenizer.get_unk_token()
+        padding_symbol = tokenizer.get_pad_token()
+        pad_idx = tokenizer.convert_token_to_id(padding_symbol)
+
+    vocab: List[str] = _get_vocabulary(
+        tokenizer_type,
+        tokenizer,
+        vocab_file,
+        unknown_symbol,
+        add_special_symbols,
+        padding_symbol,
+        unit_counts,
+        num_most_frequent,
+    )
+    vocab_set = set(vocab)
+
+    doc_unit_counts = None
+    if compute_idf:
+        # The document frequency used for TF-IDF. Similar to unit_counts, but de-duped by document.
+        document_counts = processed_lines.map(lambda x: set(x)).explode().value_counts(sort=False)
+        document_counts = processor.compute(document_counts)
+        doc_unit_counts = Counter(dict(document_counts))
+
+    if tokenizer_type != "hf_tokenizer":
+        if add_special_symbols:
+            add_or_move_symbol(vocab, vocab_set, stop_symbol, SpecialSymbol.STOP.value)
+            add_or_move_symbol(vocab, vocab_set, start_symbol, SpecialSymbol.START.value)
+            add_or_move_symbol(vocab, vocab_set, padding_symbol, SpecialSymbol.PADDING.value)
+        # Always add the UNKNOWN symbol if we're using our own tokenizer.
+        add_or_move_symbol(vocab, vocab_set, unknown_symbol, SpecialSymbol.UNKNOWN.value)
+
+    str2idx = {unit: i for i, unit in enumerate(vocab)}
+    str2freq = {unit: unit_counts.get(unit) if unit in unit_counts else 0 for unit in vocab}
+    str2idf = (
+        {unit: np.log(len(vocab) / (1 + doc_unit_counts.get(unit))) if unit in doc_unit_counts else 0 for unit in vocab}
+        if compute_idf
+        else None
+    )
+
+    if pad_idx is None and padding_symbol in str2idx.keys():
         pad_idx = str2idx[padding_symbol]
 
-    return vocab, str2idx, str2freq, max_line_length, pad_idx, padding_symbol, unknown_symbol
-
-
-def get_sequence_vector(sequence, tokenizer_type, unit_to_id, lowercase=True):
-    tokenizer = get_from_registry(tokenizer_type, tokenizer_registry)()
-
-    format_dtype = int_type(len(unit_to_id) - 1)
-    return _get_sequence_vector(
-        sequence,
-        tokenizer,
-        tokenizer_type,
-        format_dtype,
-        unit_to_id,
-        lowercase=lowercase
+    return Vocabulary(
+        vocab=vocab,
+        str2idx=str2idx,
+        str2freq=str2freq,
+        str2idf=str2idf,
+        max_sequence_length=max_sequence_length,
+        sequence_length_99ptile=sequence_length_99ptile,
+        pad_idx=pad_idx,
+        padding_symbol=padding_symbol,
+        unknown_symbol=unknown_symbol,
+        prompt_template_num_tokens=prompt_template_num_tokens,
     )
+
+
+def create_vocabulary_single_token(
+    data: Series,
+    num_most_frequent: Optional[int] = None,
+    processor: DataFrameEngine = PANDAS,
+    unknown_symbol: str = UNKNOWN_SYMBOL,
+):
+    """Computes a vocabulary over the provided data frame.
+
+    This function should be used iff the values in each row of data should be considered as a single token, e.g.,
+    category features ("interested", "not interested", "somewhat interested").
+
+    This assumption allows us to be more efficient than `create_vocabulary()` as we can skip tokenization and
+    computing the maximum sequence length, which are unnecessary for category features.
+
+    Args:
+        data: Series of string data.
+        num_most_frequent: Upper limit on vocabulary size.
+        unknown_symbol: String representation for the UNKNOWN symbol.
+        processor: Which processor to use to process data.
+
+    Returns:
+        Tuple of:
+            vocab: List of strings representing the computed vocabulary.
+            str2idx: Map of symbol to index.
+            str2freq: Map of symbol to frequency.
+    """
+    processed_counts = data.str.strip().value_counts(sort=True)
+    processed_counts = processor.compute(processed_counts)
+    full_vocab = processed_counts.index.tolist()
+    # Only add unknown symbol if num most frequent tokens is less than total number of unique tokens
+    if num_most_frequent < len(full_vocab):
+        vocab = [unknown_symbol] + full_vocab[:num_most_frequent]
+    else:
+        vocab = full_vocab
+    str2idx = {unit: i for i, unit in enumerate(vocab)}
+    str2freq = processed_counts.to_dict()
+    str2freq = {k: str2freq.get(k, 0) for k in vocab}
+    return vocab, str2idx, str2freq
 
 
 def _get_sequence_vector(
-        sequence,
-        tokenizer,
-        tokenizer_type,
-        format_dtype,
-        unit_to_id,
-        lowercase=True,
-        unknown_symbol=UNKNOWN_SYMBOL
-):
-    unit_sequence = tokenizer(
-        sequence.lower() if lowercase else sequence
-    )
+    sequence, tokenizer, tokenizer_type, format_dtype, unit_to_id, lowercase=True, unknown_symbol=UNKNOWN_SYMBOL
+) -> np.ndarray:
+    unit_sequence = tokenizer(sequence.lower() if lowercase else sequence)
 
     unit_indices_vector = np.empty(len(unit_sequence), dtype=format_dtype)
     for i in range(len(unit_sequence)):
         curr_unit = unit_sequence[i]
-        if tokenizer_type == 'hf_tokenizer':
+        if tokenizer_type == "hf_tokenizer":
             unit_indices_vector[i] = curr_unit
         else:
             if curr_unit in unit_to_id:
                 unit_indices_vector[i] = unit_to_id[curr_unit]
             else:
                 unit_indices_vector[i] = unit_to_id[unknown_symbol]
+
+    # Add start and stop symbols.
+    # Huggingface's pretrained tokenizers take care of this implicitly:
+    # https://huggingface.co/docs/transformers/preprocessing
+    if tokenizer_type != "hf_tokenizer":
+        unit_indices_vector = np.append(unit_indices_vector, unit_to_id[STOP_SYMBOL])
+        unit_indices_vector = np.insert(unit_indices_vector, 0, unit_to_id[START_SYMBOL])
     return unit_indices_vector
 
 
 def build_sequence_matrix(
-        sequences,
-        inverse_vocabulary,
-        tokenizer_type,
-        length_limit,
-        padding_symbol,
-        padding='right',
-        unknown_symbol=UNKNOWN_SYMBOL,
-        lowercase=True,
-        tokenizer_vocab_file=None,
-        pretrained_model_name_or_path=None
-
-):
-    tokenizer = get_from_registry(tokenizer_type, tokenizer_registry)(
+    sequences,  # pd.core.series.Series
+    inverse_vocabulary,
+    tokenizer_type,
+    length_limit,
+    padding_symbol=PADDING_SYMBOL,
+    padding="right",
+    unknown_symbol=UNKNOWN_SYMBOL,
+    lowercase=True,
+    tokenizer_vocab_file=None,
+    pretrained_model_name_or_path=None,
+    processor=PANDAS,
+) -> np.ndarray:
+    tokenizer = get_tokenizer_from_registry(tokenizer_type)(
         vocab_file=tokenizer_vocab_file,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
     )
 
     format_dtype = int_type(len(inverse_vocabulary) - 1)
 
-    max_length = 0
-    unit_vectors = []
-    for sequence in sequences:
-        unit_indices_vector = _get_sequence_vector(
+    unit_vectors = sequences.map(
+        lambda sequence: _get_sequence_vector(
             sequence,
             tokenizer,
             tokenizer_type,
             format_dtype,
             inverse_vocabulary,
             lowercase=lowercase,
-            unknown_symbol=unknown_symbol
+            unknown_symbol=unknown_symbol,
         )
-        unit_vectors.append(unit_indices_vector)
-        if len(unit_indices_vector) > max_length:
-            max_length = len(unit_indices_vector)
+    )
 
+    max_length = processor.compute(unit_vectors.map(len).max())
     if max_length < length_limit:
-        logging.debug('max length of {0}: {1} < limit: {2}'.format(
-            format, max_length, length_limit
-        ))
+        logger.debug(f"max length of {format}: {max_length} < limit: {length_limit}")
     max_length = length_limit
-    sequence_matrix = np.full((len(sequences), max_length),
-                              inverse_vocabulary[padding_symbol],
-                              dtype=format_dtype)
-    for i, vector in enumerate(unit_vectors):
+
+    if tokenizer_type == "hf_tokenizer":
+        padding_symbol = tokenizer.get_pad_token()
+        pad_token_id = tokenizer.convert_token_to_id(padding_symbol)
+    else:
+        pad_token_id = inverse_vocabulary[padding_symbol]
+
+    def pad(vector):
+        sequence = np.full((int(max_length),), pad_token_id, dtype=format_dtype)
         limit = min(vector.shape[0], max_length)
-        if padding == 'right':
-            sequence_matrix[i, :limit] = vector[:limit]
+        if padding == "right":
+            sequence[:limit] = vector[:limit]
         else:  # if padding == 'left
-            sequence_matrix[i, max_length - limit:] = vector[:limit]
-
-    return sequence_matrix
-
-
-class BaseTokenizer:
-    @abstractmethod
-    def __init__(self, **kwargs):
-        pass
-
-    @abstractmethod
-    def __call__(self, text):
-        pass
-
-
-class CharactersToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return text
-
-
-class SpaceStringToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return SPLIT_REGEX.split(text.strip())
-
-
-class SpacePunctuationStringToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return SPACE_PUNCTUATION_REGEX.findall(text.strip())
-
-
-class UnderscoreStringToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return UNDERSCORE_REGEX.split(text.strip())
-
-
-class CommaStringToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return COMMA_REGEX.split(text.strip())
-
-
-class UntokenizedStringToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return [text]
-
-
-class StrippedStringToListTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return [text.strip()]
-
-
-class EnglishTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('en'))
-
-
-class EnglishFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('en'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class EnglishRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('en'),
-            filter_stopwords=True
-        )
-
-
-class EnglishLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        process_text(text, load_nlp_pipeline('en'), return_lemma=True)
-
-
-class EnglishLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('en'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class EnglishLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('en'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class ItalianTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('it'))
-
-
-class ItalianFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('it'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class ItalianRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('it'),
-            filter_stopwords=True
-        )
-
-
-class ItalianLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('it'),
-            return_lemma=True
-        )
-
-
-class ItalianLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('it'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class ItalianLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('it'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class SpanishTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('es'))
-
-
-class SpanishFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('es'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class SpanishRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('es'),
-            filter_stopwords=True
-        )
-
-
-class SpanishLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('es'),
-            return_lemma=True
-        )
-
-
-class SpanishLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('es'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class SpanishLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('es'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class GermanTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('de'))
-
-
-class GermanFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('de'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class GermanRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('de'),
-            filter_stopwords=True
-        )
-
-
-class GermanLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('de'),
-            return_lemma=True
-        )
-
-
-class GermanLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('de'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class GermanLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('de'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class FrenchTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('fr'))
-
-
-class FrenchFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('fr'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class FrenchRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('fr'),
-            filter_stopwords=True
-        )
-
-
-class FrenchLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('fr'),
-            return_lemma=True
-        )
-
-
-class FrenchLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('fr'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class FrenchLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('fr'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class PortugueseTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('pt'))
-
-
-class PortugueseFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pt'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class PortugueseRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pt'),
-            filter_stopwords=True
-        )
-
-
-class PortugueseLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('pt'), return_lemma=True)
-
-
-class PortugueseLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pt'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class PortugueseLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pt'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class DutchTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('nl'))
-
-
-class DutchFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nl'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class DutchRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nl'),
-            filter_stopwords=True
-        )
-
-
-class DutchLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('nl'), return_lemma=True)
-
-
-class DutchLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nl'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class DutchLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nl'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class GreekTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('el'))
-
-
-class GreekFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('el'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class GreekRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('el'),
-            filter_stopwords=True
-        )
-
-
-class GreekLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('el'), return_lemma=True)
-
-
-class GreekLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('el'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class GreekLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('el'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class NorwegianTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('nb'))
-
-
-class NorwegianFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nb'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class NorwegianRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nb'),
-            filter_stopwords=True
-        )
-
-
-class NorwegianLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('nb'), return_lemma=True)
-
-
-class NorwegianLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nb'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class NorwegianLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('nb'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class LithuanianTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('lt'))
-
-
-class LithuanianFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('lt'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class LithuanianRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('lt'),
-            filter_stopwords=True
-        )
-
-
-class LithuanianLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('lt'), return_lemma=True)
-
-
-class LithuanianLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('lt'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class LithuanianLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('lt'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class DanishTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('da'))
-
-
-class DanishFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('da'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class DanishRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('da'),
-            filter_stopwords=True
-        )
-
-
-class DanishLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('da'), return_lemma=True)
-
-
-class DanishLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('da'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class DanishLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('da'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class PolishTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('pl'))
-
-
-class PolishFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pl'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class PolishRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pl'),
-            filter_stopwords=True
-        )
-
-
-class PolishLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('pl'), return_lemma=True)
-
-
-class PolishLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pl'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class PolishLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('pl'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class RomanianTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('ro'))
-
-
-class RomanianFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('ro'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class RomanianRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('ro'),
-            filter_stopwords=True
-        )
-
-
-class RomanianLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('ro'), return_lemma=True)
-
-
-class RomanianLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('ro'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class RomanianLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('ro'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class JapaneseTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('jp'))
-
-
-class JapaneseFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('jp'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class JapaneseRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('jp'),
-            filter_stopwords=True
-        )
-
-
-class JapaneseLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('jp'), return_lemma=True)
-
-
-class JapaneseLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('jp'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class JapaneseLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('jp'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class ChineseTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('zh'))
-
-
-class ChineseFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('zh'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class ChineseRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('zh'),
-            filter_stopwords=True
-        )
-
-
-class ChineseLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('zh'), return_lemma=True)
-
-
-class ChineseLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('zh'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class ChineseLemmatizeRemoveStopwordsFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('zh'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class MultiTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('xx'))
-
-
-class MultiFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('xx'),
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class MultiRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('xx'),
-            filter_stopwords=True
-        )
-
-
-class MultiLemmatizeTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(text, load_nlp_pipeline('xx'), return_lemma=True)
-
-
-class MultiLemmatizeFilterTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('xx'),
-            return_lemma=True,
-            filter_numbers=True,
-            filter_punctuation=True,
-            filter_short_tokens=True
-        )
-
-
-class MultiLemmatizeRemoveStopwordsTokenizer(BaseTokenizer):
-    def __call__(self, text):
-        return process_text(
-            text,
-            load_nlp_pipeline('xx'),
-            return_lemma=True,
-            filter_stopwords=True
-        )
-
-
-class HFTokenizer(BaseTokenizer):
-    def __init__(self,
-                 pretrained_model_name_or_path,
-                 **kwargs
-                 ):
-        super().__init__()
-        from transformers import AutoTokenizer
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path,
-        )
-
-    def __call__(self, text):
-        return self.tokenizer.encode(text)
-
-
-tokenizer_registry = {
-    'characters': CharactersToListTokenizer,
-    'space': SpaceStringToListTokenizer,
-    'space_punct': SpacePunctuationStringToListTokenizer,
-    'underscore': UnderscoreStringToListTokenizer,
-    'comma': CommaStringToListTokenizer,
-    'untokenized': UntokenizedStringToListTokenizer,
-    'stripped': StrippedStringToListTokenizer,
-    'english_tokenize': EnglishTokenizer,
-    'english_tokenize_filter': EnglishFilterTokenizer,
-    'english_tokenize_remove_stopwords': EnglishRemoveStopwordsTokenizer,
-    'english_lemmatize': EnglishLemmatizeTokenizer,
-    'english_lemmatize_filter': EnglishLemmatizeFilterTokenizer,
-    'english_lemmatize_remove_stopwords': EnglishLemmatizeRemoveStopwordsTokenizer,
-    'italian_tokenize': ItalianTokenizer,
-    'italian_tokenize_filter': ItalianFilterTokenizer,
-    'italian_tokenize_remove_stopwords': ItalianRemoveStopwordsTokenizer,
-    'italian_lemmatize': ItalianLemmatizeTokenizer,
-    'italian_lemmatize_filter': ItalianLemmatizeFilterTokenizer,
-    'italian_lemmatize_remove_stopwords': ItalianLemmatizeRemoveStopwordsTokenizer,
-    'spanish_tokenize': SpanishTokenizer,
-    'spanish_tokenize_filter': SpanishFilterTokenizer,
-    'spanish_tokenize_remove_stopwords': SpanishRemoveStopwordsTokenizer,
-    'spanish_lemmatize': SpanishLemmatizeTokenizer,
-    'spanish_lemmatize_filter': SpanishLemmatizeFilterTokenizer,
-    'spanish_lemmatize_remove_stopwords': SpanishLemmatizeRemoveStopwordsTokenizer,
-    'german_tokenize': GermanTokenizer,
-    'german_tokenize_filter': GermanFilterTokenizer,
-    'german_tokenize_remove_stopwords': GermanRemoveStopwordsTokenizer,
-    'german_lemmatize': GermanLemmatizeTokenizer,
-    'german_lemmatize_filter': GermanLemmatizeFilterTokenizer,
-    'german_lemmatize_remove_stopwords': GermanLemmatizeRemoveStopwordsTokenizer,
-    'french_tokenize': FrenchTokenizer,
-    'french_tokenize_filter': FrenchFilterTokenizer,
-    'french_tokenize_remove_stopwords': FrenchRemoveStopwordsTokenizer,
-    'french_lemmatize': FrenchLemmatizeTokenizer,
-    'french_lemmatize_filter': FrenchLemmatizeFilterTokenizer,
-    'french_lemmatize_remove_stopwords': FrenchLemmatizeRemoveStopwordsTokenizer,
-    'portuguese_tokenize': PortugueseTokenizer,
-    'portuguese_tokenize_filter': PortugueseFilterTokenizer,
-    'portuguese_tokenize_remove_stopwords': PortugueseRemoveStopwordsTokenizer,
-    'portuguese_lemmatize': PortugueseLemmatizeTokenizer,
-    'portuguese_lemmatize_filter': PortugueseLemmatizeFilterTokenizer,
-    'portuguese_lemmatize_remove_stopwords': PortugueseLemmatizeRemoveStopwordsTokenizer,
-    'dutch_tokenize': DutchTokenizer,
-    'dutch_tokenize_filter': DutchFilterTokenizer,
-    'dutch_tokenize_remove_stopwords': DutchRemoveStopwordsTokenizer,
-    'dutch_lemmatize': DutchLemmatizeTokenizer,
-    'dutch_lemmatize_filter': DutchLemmatizeFilterTokenizer,
-    'dutch_lemmatize_remove_stopwords': DutchLemmatizeRemoveStopwordsTokenizer,
-    'greek_tokenize': GreekTokenizer,
-    'greek_tokenize_filter': GreekFilterTokenizer,
-    'greek_tokenize_remove_stopwords': GreekRemoveStopwordsTokenizer,
-    'greek_lemmatize': GreekLemmatizeTokenizer,
-    'greek_lemmatize_filter': GreekLemmatizeFilterTokenizer,
-    'greek_lemmatize_remove_stopwords': GreekLemmatizeRemoveStopwordsFilterTokenizer,
-    'norwegian_tokenize': NorwegianTokenizer,
-    'norwegian_tokenize_filter': NorwegianFilterTokenizer,
-    'norwegian_tokenize_remove_stopwords': NorwegianRemoveStopwordsTokenizer,
-    'norwegian_lemmatize': NorwegianLemmatizeTokenizer,
-    'norwegian_lemmatize_filter': NorwegianLemmatizeFilterTokenizer,
-    'norwegian_lemmatize_remove_stopwords': NorwegianLemmatizeRemoveStopwordsFilterTokenizer,
-    'lithuanian_tokenize': LithuanianTokenizer,
-    'lithuanian_tokenize_filter': LithuanianFilterTokenizer,
-    'lithuanian_tokenize_remove_stopwords': LithuanianRemoveStopwordsTokenizer,
-    'lithuanian_lemmatize': LithuanianLemmatizeTokenizer,
-    'lithuanian_lemmatize_filter': LithuanianLemmatizeFilterTokenizer,
-    'lithuanian_lemmatize_remove_stopwords': LithuanianLemmatizeRemoveStopwordsFilterTokenizer,
-    'danish_tokenize': DanishTokenizer,
-    'danish_tokenize_filter': DanishFilterTokenizer,
-    'danish_tokenize_remove_stopwords': DanishRemoveStopwordsTokenizer,
-    'danish_lemmatize': DanishLemmatizeTokenizer,
-    'danish_lemmatize_filter': DanishLemmatizeFilterTokenizer,
-    'danish_lemmatize_remove_stopwords': DanishLemmatizeRemoveStopwordsFilterTokenizer,
-    'polish_tokenize': PolishTokenizer,
-    'polish_tokenize_filter': PolishFilterTokenizer,
-    'polish_tokenize_remove_stopwords': PolishRemoveStopwordsTokenizer,
-    'polish_lemmatize': PolishLemmatizeTokenizer,
-    'polish_lemmatize_filter': PolishLemmatizeFilterTokenizer,
-    'polish_lemmatize_remove_stopwords': PolishLemmatizeRemoveStopwordsFilterTokenizer,
-    'romanian_tokenize': RomanianTokenizer,
-    'romanian_tokenize_filter': RomanianFilterTokenizer,
-    'romanian_tokenize_remove_stopwords': RomanianRemoveStopwordsTokenizer,
-    'romanian_lemmatize': RomanianLemmatizeTokenizer,
-    'romanian_lemmatize_filter': RomanianLemmatizeFilterTokenizer,
-    'romanian_lemmatize_remove_stopwords': RomanianLemmatizeRemoveStopwordsFilterTokenizer,
-    'japanese_tokenize': JapaneseTokenizer,
-    'japanese_tokenize_filter': JapaneseFilterTokenizer,
-    'japanese_tokenize_remove_stopwords': JapaneseRemoveStopwordsTokenizer,
-    'japanese_lemmatize': JapaneseLemmatizeTokenizer,
-    'japanese_lemmatize_filter': JapaneseLemmatizeFilterTokenizer,
-    'japanese_lemmatize_remove_stopwords': JapaneseLemmatizeRemoveStopwordsFilterTokenizer,
-    'chinese_tokenize': ChineseTokenizer,
-    'chinese_tokenize_filter': ChineseFilterTokenizer,
-    'chinese_tokenize_remove_stopwords': ChineseRemoveStopwordsTokenizer,
-    'chinese_lemmatize': ChineseLemmatizeTokenizer,
-    'chinese_lemmatize_filter': ChineseLemmatizeFilterTokenizer,
-    'chinese_lemmatize_remove_stopwords': ChineseLemmatizeRemoveStopwordsFilterTokenizer,
-    'multi_tokenize': MultiTokenizer,
-    'multi_tokenize_filter': MultiFilterTokenizer,
-    'multi_tokenize_remove_stopwords': MultiRemoveStopwordsTokenizer,
-    'multi_lemmatize': MultiLemmatizeTokenizer,
-    'multi_lemmatize_filter': MultiLemmatizeFilterTokenizer,
-    'multi_lemmatize_remove_stopwords': MultiLemmatizeRemoveStopwordsTokenizer,
-    'hf_tokenizer': HFTokenizer
-}
+            sequence[max_length - limit :] = vector[:limit]
+        return sequence
+
+    padded = processor.map_objects(unit_vectors, pad)
+    return padded
+
+
+def get_tokenizer(tokenizer_type: str, tokenizer_vocab_file: str, pretrained_model_name_or_path: str):
+    """Returns a tokenizer object based on the tokenizer type."""
+    return get_tokenizer_from_registry(tokenizer_type)(
+        vocab_file=tokenizer_vocab_file,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+    )
